@@ -22,6 +22,7 @@ val compilerPlugins = List(
 val commonSettings = Seq(
   scalaVersion := "2.13.1",
   scalacOptions ~= (_.filterNot(_ == "-Xfatal-warnings") ++ Seq(
+    "-Ymacro-annotations",
     "-Yimports:" ++ List(
       "scala",
       "scala.Predef",
@@ -36,8 +37,12 @@ val commonSettings = Seq(
   name := "kafka-demo",
   updateOptions := updateOptions.value.withGigahorse(false),
   libraryDependencies ++= Seq(
+    "org.http4s"     %% "http4s-blaze-server"  % "0.21.0-M5",
+    "org.http4s"     %% "http4s-dsl"           % "0.21.0-M5",
+    "org.http4s"     %% "http4s-circe"         % "0.21.0-M5",
     "dev.profunktor" %% "console4cats"         % "0.8.0",
     "ch.qos.logback" % "logback-classic"       % "1.2.3",
+    "org.typelevel"  %% "cats-tagless-macros"  % "0.10",
     "io.circe"       %% "circe-generic-extras" % "0.12.2",
     "com.olegpy"     %% "meow-mtl-core"        % "0.4.0",
     "com.olegpy"     %% "meow-mtl-effects"     % "0.4.0",
@@ -48,8 +53,10 @@ val commonSettings = Seq(
 
 def app(name: String) = Project(name, file(s"applications/$name")).settings(commonSettings)
 
-val stock   = app("stock")
-val reports = app("reports")
+val events = project.in(file("applications/events")).settings(commonSettings)
+val stock  = app("stock").dependsOn(events)
+
+val reports = app("reports").dependsOn(events)
 
 val root =
   project.in(file(".")).settings(commonSettings).settings(skip in publish := true).aggregate(stock, reports)
