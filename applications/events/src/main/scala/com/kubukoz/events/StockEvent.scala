@@ -1,25 +1,16 @@
 package com.kubukoz.events
 
-import io.circe.generic.extras.Configuration
-import io.circe.generic.extras.semiauto._
-import io.circe.Codec
 import cats.mtl.FunctorTell
 import cats.data.Chain
 import cats.data.Kleisli
-
-object circeConfig {
-  implicit val config: Configuration = Configuration.default.withDiscriminator("@type")
-}
 
 sealed trait StockEvent extends Product with Serializable
 
 object StockEvent {
   final case class Created(tag: String) extends StockEvent
 
-  import circeConfig._
-  import io.circe.generic.extras.semiauto._
-
-  implicit val codec: Codec[StockEvent] = deriveConfiguredCodec
+  import vulcan.generic._
+  implicit val avroCodec: vulcan.Codec[StockEvent] = vulcan.Codec.derive
 
   type Write[F[_]]     = FunctorTell[F, Chain[StockEvent]]
   type WriteK[F[_], A] = Kleisli[F, Write[F], A]

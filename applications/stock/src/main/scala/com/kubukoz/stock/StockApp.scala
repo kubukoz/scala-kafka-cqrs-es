@@ -6,7 +6,6 @@ import fs2.kafka.ProducerRecord
 import fs2.kafka.ProducerRecords
 import cats.data.Chain
 import cats.mtl.FunctorTell
-import io.circe.syntax._
 import cats.tagless.finalAlg
 import org.http4s.HttpRoutes
 import org.http4s.dsl.Http4sDsl
@@ -18,31 +17,28 @@ import cats.mtl.DefaultFunctorTell
 import org.http4s.server.blaze.BlazeServerBuilder
 import org.http4s.implicits._
 import org.http4s._
+import fs2.kafka.vulcan._
 
 object StockApp extends IOApp {
-  val serializeEvent: Serializer[IO, StockEvent] = Serializer.string[IO].contramap(_.asJson.noSpaces)
 
   def run(args: List[String]): IO[ExitCode] = {
+    val avroSettings = AvroSettings(SchemaRegistryClientSettings[IO]("http://localhost:8081"))
+
+    implicit val eventSerializer: Serializer[IO, StockEvent] =
+      avroSerializer[StockEvent].using(avroSettings).forValue.unsafeRunSync()
 
     val stockEventProducer = fs2.kafka
       .producerResource[IO]
       .using(
-        ProducerSettings(Serializer.unit[IO], serializeEvent).withBootstrapServers("localhost:9092")
+        ProducerSettings[IO, Unit, StockEvent].withBootstrapServers("localhost:9092")
       )
-
-    implicit def writeToKleisliOfTell[F[_]: Functor, Log]: FunctorTell[Kleisli[F, FunctorTell[F, Log], ?], Log] =
-      new DefaultFunctorTell[Kleisli[F, FunctorTell[F, Log], ?], Log] {
-        val functor: Functor[Kleisli[F, FunctorTell[F, Log], ?]] = Functor[Kleisli[F, FunctorTell[F, Log], ?]]
-
-        def tell(l: Log): Kleisli[F, FunctorTell[F, Log], Unit] = Kleisli { _.tell(l) }
-      }
 
     val app: Resource[IO, Unit] = for {
       producer <- stockEventProducer
 
       service    = StockService.instance[StockEvent.WriteK[IO, ?]]
       routes     = StockRoutes.make(service)
-      middleware = WriterSenderMiddleware(sendMessages(producer)) _
+      middleware = WriterSenderMiddleware(sendMessages(producer))
 
       _ <- BlazeServerBuilder[IO].withHttpApp(middleware(routes).orNotFound).resource
     } yield ()
@@ -53,22 +49,27 @@ object StockApp extends IOApp {
   def sendMessages[F[_]: FlatMap](producer: KafkaProducer[F, Unit, StockEvent])(events: Chain[StockEvent]): F[Unit] = {
     val messages = ProducerRecords(events.map(event => ProducerRecord("stock-event", (), event)))
 
-    producer.produce(messages).flatten.void
+    producer.produce(messages).flatMap(_.void)
   }
 
+  implicit def deriveTellFromKleisliOfTell[F[_]: Functor, Log]: FunctorTell[Kleisli[F, FunctorTell[F, Log], ?], Log] =
+    new DefaultFunctorTell[Kleisli[F, FunctorTell[F, Log], ?], Log] {
+      val functor: Functor[Kleisli[F, FunctorTell[F, Log], ?]] = Functor[Kleisli[F, FunctorTell[F, Log], ?]]
+
+      def tell(l: Log): Kleisli[F, FunctorTell[F, Log], Unit] = Kleisli { _.tell(l) }
+    }
 }
 
 object WriterSenderMiddleware {
   import com.olegpy.meow.effects._
 
   def apply[F[_]: Sync, Logs: Monoid](send: Logs => F[Unit])(
-    routes: HttpRoutes[Kleisli[F, FunctorTell[F, Logs], ?]]
-  ): HttpRoutes[F] =
-    routes.local[Request[F]](_.mapK(Kleisli.liftK)).mapF { underlying =>
+    ): HttpRoutes[Kleisli[F, FunctorTell[F, Logs], ?]] => HttpRoutes[F] =
+    _.local[Request[F]](_.mapK(Kleisli.liftK)).mapF { underlying =>
       OptionT.liftF(Ref[F].of(Monoid[Logs].empty)).flatMap { ref =>
-        ref.runTell { tell =>
-          underlying.mapK(Kleisli.applyK(tell)).map(_.mapK(Kleisli.applyK(tell)))
-        } <* OptionT.liftF(ref.get.flatMap(send))
+        val run = Kleisli.applyK[F, FunctorTell[F, Logs]](ref.tellInstance)
+
+        underlying.mapK(run).map(_.mapK(run)) <* OptionT.liftF(ref.get.flatMap(send))
       }
     }
 }

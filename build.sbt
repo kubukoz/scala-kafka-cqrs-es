@@ -36,6 +36,7 @@ val commonSettings = Seq(
   fork in Test := true,
   name := "kafka-demo",
   updateOptions := updateOptions.value.withGigahorse(false),
+  resolvers += "confluent" at "https://packages.confluent.io/maven/",
   libraryDependencies ++= Seq(
     "org.http4s"     %% "http4s-blaze-server"  % "0.21.0-M5",
     "org.http4s"     %% "http4s-dsl"           % "0.21.0-M5",
@@ -46,7 +47,8 @@ val commonSettings = Seq(
     "io.circe"       %% "circe-generic-extras" % "0.12.2",
     "com.olegpy"     %% "meow-mtl-core"        % "0.4.0",
     "com.olegpy"     %% "meow-mtl-effects"     % "0.4.0",
-    "com.ovoenergy"  %% "fs2-kafka"            % "0.20.2",
+    "com.ovoenergy"  %% "fs2-kafka-vulcan"     % "0.20.2",
+    "com.ovoenergy"  %% "vulcan-generic"       % "0.3.1",
     "org.scalatest"  %% "scalatest"            % "3.1.0" % Test
   ) ++ compilerPlugins
 )
