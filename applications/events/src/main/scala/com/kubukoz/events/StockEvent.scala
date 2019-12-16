@@ -5,6 +5,7 @@ import io.circe.generic.extras.semiauto._
 import io.circe.Codec
 import cats.mtl.FunctorTell
 import cats.data.Chain
+import cats.data.Kleisli
 
 object circeConfig {
   implicit val config: Configuration = Configuration.default.withDiscriminator("@type")
@@ -20,7 +21,8 @@ object StockEvent {
 
   implicit val codec: Codec[StockEvent] = deriveConfiguredCodec
 
-  type Write[F[_]] = FunctorTell[F, Chain[StockEvent]]
+  type Write[F[_]]     = FunctorTell[F, Chain[StockEvent]]
+  type WriteK[F[_], A] = Kleisli[F, Write[F], A]
 
   def Write[F[_]](implicit F: Write[F]): Write[F] = F
 

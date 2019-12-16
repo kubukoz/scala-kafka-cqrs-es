@@ -41,8 +41,8 @@ object StockApp extends IOApp {
 
     val app: Resource[IO, Unit] = for {
       producer <- stockEventProducer
-      service = StockService.instance[Kleisli[IO, StockEvent.Write[IO], ?]]
-      route   = StockRoutes.make[Kleisli[IO, StockEvent.Write[IO], ?]](service)
+      service = StockService.instance[StockEvent.WriteK[IO, ?]]
+      route   = StockRoutes.make(service)
       server <- BlazeServerBuilder[IO]
         .withHttpApp(WriterSenderMiddleware(route)(log => producer.produce(toKafka(log)).flatten.void).orNotFound)
         .resource
@@ -58,19 +58,18 @@ object StockApp extends IOApp {
 object WriterSenderMiddleware {
   import com.olegpy.meow.effects._
 
-  def apply[F[_]: Sync, Log](
-    routes: HttpRoutes[Kleisli[F, FunctorTell[F, Chain[Log]], ?]]
-  )(send: Chain[Log] => F[Unit]): HttpRoutes[F] =
-    Kleisli { request =>
-      OptionT.liftF(Ref[F].of(Chain.empty[Log])).flatMap { ref =>
-        val runUnderlying = ref.runTell { tell =>
-          routes.run(request.mapK(Kleisli.liftK)).mapK(Kleisli.applyK(tell)).map(_.mapK(Kleisli.applyK(tell)))
-        }
-
-        runUnderlying <* OptionT.liftF(ref.get.flatMap(send))
+  def apply[F[_]: Sync, Logs: Monoid](
+    routes: HttpRoutes[Kleisli[F, FunctorTell[F, Logs], ?]]
+  )(send: Logs => F[Unit]): HttpRoutes[F] =
+    routes.local[Request[F]](_.mapK(Kleisli.liftK)).mapF { underlying =>
+      OptionT.liftF(Ref[F].of(Monoid[Logs].empty)).flatMap { ref =>
+        ref.runTell { tell =>
+          underlying.mapK(Kleisli.applyK(tell)).map(_.mapK(Kleisli.applyK(tell)))
+        } <* OptionT.liftF(ref.get.flatMap(send))
       }
     }
 }
+
 final case class CreateStock(tag: String)
 
 @finalAlg
