@@ -11,13 +11,11 @@ import org.http4s.HttpRoutes
 import org.http4s.dsl.Http4sDsl
 import fs2.kafka.Serializer
 import fs2.kafka.ProducerSettings
-import cats.data.Kleisli
-import cats.data.OptionT
-import cats.mtl.DefaultFunctorTell
 import org.http4s.server.blaze.BlazeServerBuilder
 import org.http4s.implicits._
 import org.http4s._
 import fs2.kafka.vulcan._
+import com.kubukoz.util.KafkaUtils._
 
 object StockApp extends IOApp {
 
@@ -51,27 +49,6 @@ object StockApp extends IOApp {
 
     producer.produce(messages).flatMap(_.void)
   }
-
-  implicit def deriveTellFromKleisliOfTell[F[_]: Functor, Log]: FunctorTell[Kleisli[F, FunctorTell[F, Log], ?], Log] =
-    new DefaultFunctorTell[Kleisli[F, FunctorTell[F, Log], ?], Log] {
-      val functor: Functor[Kleisli[F, FunctorTell[F, Log], ?]] = Functor[Kleisli[F, FunctorTell[F, Log], ?]]
-
-      def tell(l: Log): Kleisli[F, FunctorTell[F, Log], Unit] = Kleisli { _.tell(l) }
-    }
-}
-
-object WriterSenderMiddleware {
-  import com.olegpy.meow.effects._
-
-  def apply[F[_]: Sync, Logs: Monoid](send: Logs => F[Unit])(
-    ): HttpRoutes[Kleisli[F, FunctorTell[F, Logs], ?]] => HttpRoutes[F] =
-    _.local[Request[F]](_.mapK(Kleisli.liftK)).mapF { underlying =>
-      OptionT.liftF(Ref[F].of(Monoid[Logs].empty)).flatMap { ref =>
-        val run = Kleisli.applyK[F, FunctorTell[F, Logs]](ref.tellInstance)
-
-        underlying.mapK(run).map(_.mapK(run)) <* OptionT.liftF(ref.get.flatMap(send))
-      }
-    }
 }
 
 final case class CreateStock(tag: String)
