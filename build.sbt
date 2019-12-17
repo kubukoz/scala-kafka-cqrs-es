@@ -34,7 +34,6 @@ val commonSettings = Seq(
     ).mkString(",")
   )),
   fork in Test := true,
-  name := "kafka-demo",
   updateOptions := updateOptions.value.withGigahorse(false),
   resolvers += "confluent" at "https://packages.confluent.io/maven/",
   libraryDependencies ++= Seq(
@@ -53,12 +52,17 @@ val commonSettings = Seq(
   ) ++ compilerPlugins
 )
 
-def app(name: String) = Project(name, file(s"applications/$name")).settings(commonSettings)
+def app(name: String) =
+  Project(name, file(s"applications/$name")).settings(commonSettings).enablePlugins(JavaAppPackaging)
 
 val events = project.in(file("applications/events")).settings(commonSettings)
-val stock  = app("stock").dependsOn(events)
 
+val stock   = app("stock").dependsOn(events)
 val reports = app("reports").dependsOn(events)
 
 val root =
-  project.in(file(".")).settings(commonSettings).settings(skip in publish := true).aggregate(stock, reports)
+  project
+    .in(file("."))
+    .settings(name := "kafka-demo", commonSettings)
+    .settings(skip in publish := true)
+    .aggregate(stock, reports)

@@ -5,11 +5,9 @@ import fs2.kafka.KafkaProducer
 import fs2.kafka.ProducerRecord
 import fs2.kafka.ProducerRecords
 import cats.data.Chain
-import cats.mtl.FunctorTell
 import cats.tagless.finalAlg
 import org.http4s.HttpRoutes
 import org.http4s.dsl.Http4sDsl
-import fs2.kafka.Serializer
 import fs2.kafka.ProducerSettings
 import org.http4s.server.blaze.BlazeServerBuilder
 import org.http4s.implicits._
@@ -22,14 +20,14 @@ object StockApp extends IOApp {
   def run(args: List[String]): IO[ExitCode] = {
     val avroSettings = AvroSettings(SchemaRegistryClientSettings[IO]("http://localhost:8081"))
 
-    implicit val eventSerializer: Serializer[IO, StockEvent] =
-      avroSerializer[StockEvent].using(avroSettings).forValue.unsafeRunSync()
-
-    val stockEventProducer = fs2.kafka
-      .producerResource[IO]
-      .using(
-        ProducerSettings[IO, Unit, StockEvent].withBootstrapServers("localhost:9092")
-      )
+    val stockEventProducer =
+      Resource.liftF(avroSerializer[StockEvent].using(avroSettings).forValue).flatMap { implicit eventSerializer =>
+        fs2.kafka
+          .producerResource[IO]
+          .using(
+            ProducerSettings[IO, Unit, StockEvent].withBootstrapServers("localhost:9092")
+          )
+      }
 
     val app: Resource[IO, Unit] = for {
       producer <- stockEventProducer
