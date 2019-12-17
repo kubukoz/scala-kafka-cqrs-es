@@ -5,7 +5,6 @@ import fs2.kafka._
 import fs2.kafka.vulcan._
 import fs2.Stream
 import scala.concurrent.duration._
-import fs2.Chunk
 import fs2.Pipe
 
 object ReportApp extends IOApp {
@@ -37,7 +36,7 @@ object ReportApp extends IOApp {
     Stream
       .resource(consumer)
       .flatMap(_.stream)
-      .evalMap(handleDecodedEvent)
+      .evalMap(handleDecodedEvent(outTopic = "demo")(handler))
       .groupWithin(100, 100.millis)
       .map(TransactionalProducerRecords(_))
       .through(
@@ -52,13 +51,17 @@ object ReportApp extends IOApp {
       .drain
   } as ExitCode.Success
 
-  def handleDecodedEvent(
-    record: CommittableConsumerRecord[IO, Unit, StockEvent]
-  ): IO[CommittableProducerRecords[IO, Unit, String]] = {
-    IO(println(record.record.value)) as {
-      val records =
-        List("foo", "bar", "bazinga").map(ProducerRecord("demo", (), _))
+  def handler(event: StockEvent): IO[List[String]] =
+    IO(println(event)) *>
+      IO.pure(List("foo", "bar", "bazinga", event.toString))
 
+  def handleDecodedEvent[F[_]: Functor, G[+_]: Foldable: Functor, K, Event, OutEvent](
+    outTopic: String
+  )(handler: Event => F[G[OutEvent]])(
+    record: CommittableConsumerRecord[F, K, Event]
+  ): F[CommittableProducerRecords[F, Unit, OutEvent]] = {
+    handler(record.record.value).map { events =>
+      val records = events.map(ProducerRecord(outTopic, (), _))
       CommittableProducerRecords(records, record.offset)
     }
   }
