@@ -51,6 +51,7 @@ object ReportApp extends IOApp {
       .drain
   } as ExitCode.Success
 
+  // Commit DB transaction here for at least once processing.
   def handler(event: StockEvent): IO[List[String]] =
     IO(println(event)) *>
       IO.pure(List("foo", "bar", "bazinga", event.toString))
