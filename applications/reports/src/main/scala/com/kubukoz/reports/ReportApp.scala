@@ -14,28 +14,26 @@ object ReportApp extends IOApp {
   def run(args: List[String]): IO[ExitCode] =
     Stream
       .eval(avroDeserializer[StockEvent].using(avroSettings).forValue)
-      .flatMap { implicit ds =>
-        consumerStream[IO]
-          .using(
-            ConsumerSettings[IO, Unit, StockEvent]
-              .withGroupId("report-app")
-              .withBootstrapServers("localhost:9092")
-              .withAutoOffsetReset(AutoOffsetReset.Earliest)
-              .withIsolationLevel(IsolationLevel.ReadCommitted)
-          )
-          .evalTap(_.subscribeTo("stock-event"))
-          .flatMap(_.stream)
-          .evalMap(handleDecodedEvent(outTopic = "demo")(handler))
-          .groupWithin(100, 100.millis)
-          .map(TransactionalProducerRecords(_))
-          .through {
-            transactionalProduce(
-              TransactionalProducerSettings(
-                "report-consumer-stock-event",
-                ProducerSettings[IO, Unit, String].withRetries(10).withBootstrapServers("localhost:9092")
-              ).withTransactionTimeout(5.seconds)
-            )
-          }
+      .map { implicit ds =>
+        ConsumerSettings[IO, Unit, StockEvent]
+          .withGroupId("report-app")
+          .withBootstrapServers("localhost:9092")
+          .withAutoOffsetReset(AutoOffsetReset.Earliest)
+          .withIsolationLevel(IsolationLevel.ReadCommitted)
+      }
+      .flatMap(consumerStream(_))
+      .evalTap(_.subscribeTo("stock-event"))
+      .flatMap(_.stream)
+      .evalMap(handleDecodedEvent(outTopic = "demo")(handler))
+      .groupWithin(100, 100.millis)
+      .map(TransactionalProducerRecords(_))
+      .through {
+        transactionalProduce(
+          TransactionalProducerSettings(
+            "report-consumer-stock-event",
+            ProducerSettings[IO, Unit, String].withRetries(10).withBootstrapServers("localhost:9092")
+          ).withTransactionTimeout(5.seconds)
+        )
       }
       .compile
       .drain as ExitCode.Success
