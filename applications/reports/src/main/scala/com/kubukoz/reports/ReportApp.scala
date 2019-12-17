@@ -9,15 +9,13 @@ import fs2.Pipe
 
 object ReportApp extends IOApp {
 
-  def run(args: List[String]): IO[ExitCode] = {
-    val avroSettings = AvroSettings(SchemaRegistryClientSettings[IO]("http://localhost:8081"))
-    avroSettings.schemaRegistryClient
+  val avroSettings = AvroSettings(SchemaRegistryClientSettings[IO]("http://localhost:8081"))
 
-    val consumer = Resource
-      .liftF(avroDeserializer[StockEvent].using(avroSettings).forValue)
+  def run(args: List[String]): IO[ExitCode] =
+    Stream
+      .eval(avroDeserializer[StockEvent].using(avroSettings).forValue)
       .flatMap { implicit ds =>
-        fs2.kafka
-          .consumerResource[IO]
+        consumerStream[IO]
           .using(
             ConsumerSettings[IO, Unit, StockEvent]
               .withGroupId("report-app")
@@ -25,31 +23,22 @@ object ReportApp extends IOApp {
               .withAutoOffsetReset(AutoOffsetReset.Earliest)
               .withIsolationLevel(IsolationLevel.ReadCommitted)
           )
-      }
-      .evalTap(_.subscribeTo("stock-event"))
-
-    def transactionalProduce[F[_]: ConcurrentEffect: ContextShift, K, V, P](
-      settings: TransactionalProducerSettings[F, K, V]
-    ): Pipe[F, TransactionalProducerRecords[F, K, V, P], ProducerResult[K, V, P]] =
-      records => transactionalProducerStream(settings).flatMap(producer => records.evalMap(producer.produce))
-
-    Stream
-      .resource(consumer)
-      .flatMap(_.stream)
-      .evalMap(handleDecodedEvent(outTopic = "demo")(handler))
-      .groupWithin(100, 100.millis)
-      .map(TransactionalProducerRecords(_))
-      .through {
-        transactionalProduce(
-          TransactionalProducerSettings(
-            "report-consumer-stock-event",
-            ProducerSettings[IO, Unit, String].withRetries(10).withBootstrapServers("localhost:9092")
-          ).withTransactionTimeout(5.seconds)
-        )
+          .evalTap(_.subscribeTo("stock-event"))
+          .flatMap(_.stream)
+          .evalMap(handleDecodedEvent(outTopic = "demo")(handler))
+          .groupWithin(100, 100.millis)
+          .map(TransactionalProducerRecords(_))
+          .through {
+            transactionalProduce(
+              TransactionalProducerSettings(
+                "report-consumer-stock-event",
+                ProducerSettings[IO, Unit, String].withRetries(10).withBootstrapServers("localhost:9092")
+              ).withTransactionTimeout(5.seconds)
+            )
+          }
       }
       .compile
-      .drain
-  } as ExitCode.Success
+      .drain as ExitCode.Success
 
   // Commit DB transaction here for at least once processing.
   def handler(event: StockEvent): IO[List[String]] =
@@ -67,4 +56,8 @@ object ReportApp extends IOApp {
     }
   }
 
+  def transactionalProduce[F[_]: ConcurrentEffect: ContextShift, K, V, P](
+    settings: TransactionalProducerSettings[F, K, V]
+  ): Pipe[F, TransactionalProducerRecords[F, K, V, P], ProducerResult[K, V, P]] =
+    records => transactionalProducerStream(settings).flatMap(producer => records.evalMap(producer.produce))
 }
