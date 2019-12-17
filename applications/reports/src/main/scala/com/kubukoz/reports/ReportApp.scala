@@ -39,14 +39,14 @@ object ReportApp extends IOApp {
       .evalMap(handleDecodedEvent(outTopic = "demo")(handler))
       .groupWithin(100, 100.millis)
       .map(TransactionalProducerRecords(_))
-      .through(
+      .through {
         transactionalProduce(
           TransactionalProducerSettings(
             "report-consumer-stock-event",
             ProducerSettings[IO, Unit, String].withRetries(10).withBootstrapServers("localhost:9092")
           ).withTransactionTimeout(5.seconds)
         )
-      )
+      }
       .compile
       .drain
   } as ExitCode.Success
