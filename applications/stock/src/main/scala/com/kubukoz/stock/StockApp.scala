@@ -16,18 +16,22 @@ import fs2.kafka.vulcan._
 import com.kubukoz.util.KafkaUtils._
 import cats.mtl.ApplicativeAsk
 import skunk.Session
-import io.circe.Json
 import io.estatico.newtype.macros.newtype
 import natchez.Trace
 import cats.data.Kleisli
 import cats.mtl.DefaultApplicativeAsk
-import cats.tagless.syntax.`package`.functorK
-import cats.tagless.autoFunctorK
-import com.kubukoz.stock.SessionUtils.GetSession
 import cats.data.OptionT
 import skunk.codec.numeric
 
 object StockApp extends IOApp {
+
+  implicit def applicativeAskFunctor[F[_]]: Functor[ApplicativeAsk[F, ?]] = new Functor[ApplicativeAsk[F, ?]] {
+
+    def map[A, B](fa: ApplicativeAsk[F, A])(f: A => B): ApplicativeAsk[F, B] = new DefaultApplicativeAsk[F, B] {
+      val applicative: Applicative[F] = fa.applicative
+      val ask: F[B]                   = fa.reader(f)
+    }
+  }
 
   def run(args: List[String]): IO[ExitCode] = {
     val avroSettings = AvroSettings(SchemaRegistryClientSettings[IO]("http://localhost:8081"))
@@ -41,42 +45,37 @@ object StockApp extends IOApp {
           )
       }
 
+    val _ = stockEventProducer //todo
+
     import Trace.Implicits.noop //todo
 
     import cats.mtl.instances.all._
     import com.olegpy.meow.hierarchy.deriveApplicativeAsk
 
     val app: Resource[IO, Unit] = {
-
       type Eff[A] = Kleisli[IO, Session[IO], A]
 
-      def middleware(sessionPool: Resource[IO, Session[IO]])(routes: HttpRoutes[Eff]): HttpRoutes[IO] = HttpRoutes {
-        request =>
-          implicit val b: Bracket[OptionT[IO, ?], Throwable] = Sync[OptionT[IO, ?]]
-
-          sessionPool.mapK(OptionT.liftK).use { session =>
-            routes.run(request.mapK(Kleisli.liftK)).map(_.mapK(Kleisli.applyK(session))).mapK(Kleisli.applyK(session))
+      def skunkMiddleware(sessionPool: Resource[IO, Session[IO]])(routes: HttpRoutes[Eff]): HttpRoutes[IO] =
+        routes.mapF { run =>
+          OptionT {
+            sessionPool.map[Eff ~> IO](Kleisli.applyK).use { transact =>
+              run.mapK(transact).map(_.mapK(transact)).value
+            }
           }
-      }
+        }.local(_.mapK(Kleisli.liftK))
 
-      implicit val consoleEff: Console[Eff] = Console.io.mapK(Kleisli.liftK)
+      implicit val askF: ApplicativeAsk[Eff, Session[Eff]] = ApplicativeAsk[Eff, Session[IO]].map(_.mapK(Kleisli.liftK))
+      implicit val consoleEff: Console[Eff]                = Console.io.mapK(Kleisli.liftK)
 
       for {
         sessionPool <- Session.pooled[IO]("localhost", user = "postgres", database = "postgres", max = 10)
 
-        implicit0(repository: StockRepository[Eff]) = {
-
-          val get: GetSession[Eff, IO] = GetSession(implicitly[ApplicativeAsk[Eff, Session[IO]]])
-
-          implicit val askF: ApplicativeAsk[Eff, Session[Eff]] = get.mappedSession(Kleisli.liftK)
-
-          StockRepository.instance[Eff]
-        }
+        implicit0(repository: StockRepository[Eff]) = StockRepository.instance[Eff]
 
         service = StockService.instance[Eff]
         routes  = StockRoutes.make(service)
 
-        _ <- BlazeServerBuilder[IO].withHttpApp(middleware(sessionPool)(routes).orNotFound).resource
+        _ <- BlazeServerBuilder[IO].withHttpApp(skunkMiddleware(sessionPool)(routes).orNotFound).resource
       } yield ()
     }
 
@@ -133,44 +132,29 @@ object StockRoutes {
   }
 }
 
-import SessionUtils._
-
-import cats.tagless.implicits._
-
 @finalAlg
 trait StockRepository[F[_]] {
   def saveStock(stock: Stock): F[Stock.Id]
 }
 
 object StockRepository {
+  import SessionUtils._
 
   def instance[F[_]: Monad: Console](implicit getSession: AskSession[F]): StockRepository[F] = {
     new StockRepository[F] {
 
       def saveStock(stock: Stock): F[Stock.Id] = getSession.ask.flatMap { ses =>
-        // do something with session
         import skunk.implicits._
 
-        val a: F[Unit] =
+        val action: F[Unit] =
           ses.execute(sql"select 1".query(numeric.int4)).flatMap(Console[F].putStrLn(_))
 
-        a.as(Stock.Id(0))
+        action.as(Stock.Id(0))
       }
     }
   }
 }
 
 object SessionUtils {
-
   type AskSession[F[_]] = ApplicativeAsk[F, Session[F]]
-
-  final case class GetSession[F[_]: Defer: Applicative, G[_]: Bracket[?[_], Throwable]](
-    underlying: ApplicativeAsk[F, Session[G]]
-  ) {
-
-    def mappedSession(lift: G ~> F): ApplicativeAsk[F, Session[F]] = new DefaultApplicativeAsk[F, Session[F]] {
-      val applicative: Applicative[F] = Applicative[F]
-      val ask: F[Session[F]]          = underlying.ask.map(_.mapK(lift))
-    }
-  }
 }
