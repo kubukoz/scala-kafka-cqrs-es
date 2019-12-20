@@ -13,15 +13,14 @@ import org.http4s.server.blaze.BlazeServerBuilder
 import org.http4s.implicits._
 import org.http4s._
 import fs2.kafka.vulcan._
-import com.kubukoz.util.KafkaUtils._
 import cats.mtl.ApplicativeAsk
 import skunk.Session
 import io.estatico.newtype.macros.newtype
 import natchez.Trace
 import cats.data.Kleisli
 import cats.mtl.DefaultApplicativeAsk
-import cats.data.OptionT
 import skunk.codec.numeric
+import com.kubukoz.util.skunk.SkunkMiddleware
 
 object StockApp extends IOApp {
 
@@ -52,30 +51,19 @@ object StockApp extends IOApp {
     import cats.mtl.instances.all._
     import com.olegpy.meow.hierarchy.deriveApplicativeAsk
 
+    type Deps   = Session[IO]
+    type Eff[A] = Kleisli[IO, Deps, A]
+
+    implicit val askF: ApplicativeAsk[Eff, Session[Eff]] = ApplicativeAsk[Eff, Deps].map(_.mapK(Kleisli.liftK))
+    implicit val consoleEff: Console[Eff]                = Console.io.mapK(Kleisli.liftK)
+    implicit val repository: StockRepository[Eff]        = StockRepository.instance[Eff]
+    val service                                          = StockService.instance[Eff]
+    val routes                                           = StockRoutes.make(service)
+
     val app: Resource[IO, Unit] = {
-      type Eff[A] = Kleisli[IO, Session[IO], A]
-
-      def skunkMiddleware(sessionPool: Resource[IO, Session[IO]])(routes: HttpRoutes[Eff]): HttpRoutes[IO] =
-        routes.mapF { run =>
-          OptionT {
-            sessionPool.map[Eff ~> IO](Kleisli.applyK).use { transact =>
-              run.mapK(transact).map(_.mapK(transact)).value
-            }
-          }
-        }.local(_.mapK(Kleisli.liftK))
-
-      implicit val askF: ApplicativeAsk[Eff, Session[Eff]] = ApplicativeAsk[Eff, Session[IO]].map(_.mapK(Kleisli.liftK))
-      implicit val consoleEff: Console[Eff]                = Console.io.mapK(Kleisli.liftK)
-
       for {
         sessionPool <- Session.pooled[IO]("localhost", user = "postgres", database = "postgres", max = 10)
-
-        implicit0(repository: StockRepository[Eff]) = StockRepository.instance[Eff]
-
-        service = StockService.instance[Eff]
-        routes  = StockRoutes.make(service)
-
-        _ <- BlazeServerBuilder[IO].withHttpApp(skunkMiddleware(sessionPool)(routes).orNotFound).resource
+        _           <- BlazeServerBuilder[IO].withHttpApp(SkunkMiddleware(sessionPool)(routes).orNotFound).resource
       } yield ()
     }
 
