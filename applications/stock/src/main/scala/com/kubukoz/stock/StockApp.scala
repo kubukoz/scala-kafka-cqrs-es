@@ -21,6 +21,12 @@ import cats.data.Kleisli
 import cats.mtl.DefaultApplicativeAsk
 import skunk.codec.numeric
 import com.kubukoz.util.skunk.SkunkMiddleware
+import cats.mtl.FunctorTell
+import com.kubukoz.util.KafkaUtils.WriterSenderMiddleware
+import shapeless.HNil
+import shapeless.::
+import cats.data.OptionT
+import cats.mtl.DefaultFunctorTell
 
 object StockApp extends IOApp {
 
@@ -51,19 +57,60 @@ object StockApp extends IOApp {
     import cats.mtl.instances.all._
     import com.olegpy.meow.hierarchy.deriveApplicativeAsk
 
-    type Deps   = Session[IO]
+    type Deps          = Session[IO] :: FunctorTell[IO, Chain[StockEvent]] :: HNil
+    type DepsNoSession = FunctorTell[IO, Chain[StockEvent]] :: HNil
+
     type Eff[A] = Kleisli[IO, Deps, A]
 
-    implicit val askF: ApplicativeAsk[Eff, Session[Eff]] = ApplicativeAsk[Eff, Deps].map(_.mapK(Kleisli.liftK))
-    implicit val consoleEff: Console[Eff]                = Console.io.mapK(Kleisli.liftK)
+    type EffNoSession[A] = Kleisli[IO, DepsNoSession, A]
+
+    implicit val askTellFromEff: StockEvent.Write[Eff] = new DefaultFunctorTell[Eff, Chain[StockEvent]] {
+      val functor: Functor[Eff]                      = Functor[Eff]
+      def tell(events: Chain[StockEvent]): Eff[Unit] = Kleisli(_.tail.head.tell(events))
+    }
+    implicit val askF: ApplicativeAsk[Eff, Session[Eff]] = ApplicativeAsk[Eff, Deps].map(_.head.mapK(Kleisli.liftK))
+    implicit val consoleEff: Console[Eff]                = SyncConsole.stdio[Eff]
     implicit val repository: StockRepository[Eff]        = StockRepository.instance[Eff]
     val service                                          = StockService.instance[Eff]
     val routes                                           = StockRoutes.make(service)
 
+    def skunkMiddleware(sessionPool: Resource[IO, Session[IO]]): HttpRoutes[Eff] => HttpRoutes[EffNoSession] =
+      routes =>
+        Kleisli { request =>
+          OptionT {
+            sessionPool.mapK[EffNoSession](Kleisli.liftK).use { session =>
+              SkunkMiddleware
+                .imapKRoutes(routes)(λ[Eff ~> EffNoSession](_.local(session :: _)))(
+                  λ[EffNoSession ~> Eff](_.local(_.tail))
+                )
+                .run(request)
+                .value
+            }
+          }
+        }
+
+    type EffJustWrite[A] = Kleisli[IO, FunctorTell[IO, Chain[StockEvent]], A]
+
+    def writerSenderMiddleware(send: Chain[StockEvent] => IO[Unit]): HttpRoutes[EffNoSession] => HttpRoutes[IO] =
+      routes =>
+        WriterSenderMiddleware(send).apply(
+          SkunkMiddleware.imapKRoutes(routes)(λ[EffNoSession ~> EffJustWrite](_.local(_ :: HNil)))(
+            λ[EffJustWrite ~> EffNoSession](_.local(_.head))
+          )
+        )
+
     val app: Resource[IO, Unit] = {
       for {
+        producer    <- stockEventProducer
         sessionPool <- Session.pooled[IO]("localhost", user = "postgres", database = "postgres", max = 10)
-        _           <- BlazeServerBuilder[IO].withHttpApp(SkunkMiddleware(sessionPool)(routes).orNotFound).resource
+        _ <- BlazeServerBuilder[IO]
+          .withHttpApp(
+            writerSenderMiddleware(sendMessages(producer))
+              .compose(skunkMiddleware(sessionPool))
+              .apply(routes)
+              .orNotFound
+          )
+          .resource
       } yield ()
     }
 
@@ -96,14 +143,10 @@ trait StockService[F[_]] {
 
 object StockService {
 
-  def instance[F[_]: StockRepository: FlatMap]: StockService[F] = new StockService[F] {
+  def instance[F[_]: StockRepository: StockEvent.Write: FlatMap]: StockService[F] = new StockService[F] {
 
     def create(stock: CreateStock): F[Stock.Id] =
-      StockRepository[F].saveStock(Stock.init(stock.tag))
-    //  <*  StockEvent
-    //   .Write[F]
-    //   .tellOne(StockEvent.Created(stock.tag))
-    //   .as(??? : Stock.Id)
+      StockRepository[F].saveStock(Stock.init(stock.tag)) <* StockEvent.Write[F].tellOne(StockEvent.Created(stock.tag))
   }
 }
 
