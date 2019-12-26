@@ -14,20 +14,20 @@ The following applications are available:
 
 ### Stock Service
 
-- provides HTTP endpoints for managing stock
-- stores stock state in its database
-- sends a `StockEvent.Created` to `stock-event` topic - smuggled through the database to ensure at-least-once delivery
-- run a concurrent process to send events pending in the database
+- provides HTTP endpoints for managing stock (pending)
+- stores stock state in its database ✅
+- sends a `StockEvent.Created` to `stock-event` topic - smuggled through the database (mailbox pattern) for at-least-once delivery and consistency
+- run a concurrent process to send events pending in the database (mailbox pattern part 2)
 
 ### Report Service
 
-- reads `StockEvent`s
-- builds its own read model of stock for reports
-- builds reports
-- sends `ReportEvent.Created` to `report-event` topic
-- serves reports over HTTP
+- reads `StockEvent`s ✅
+- builds its own read model of stock for reports (pending)
+- builds reports (pending)
+- sends `ReportEvent.Created` to `report-event` topic (pending)
+- serves reports over HTTP (pending)
 
-### Notification Service
+### Notification Service (pending)
 
 - consumes `ReportEvent`s
 - notifies customers that a new report is available (in the demo case, that'll be just printing to logs)
@@ -58,4 +58,4 @@ to the broker's environment variables to enable transactional processing:
 	./applications/notifications/target/universal/stage/bin/notifications
 	```
 
-3. Use swagger to call application endpoints. All apps expose a Swagger UI at `/swagger`.
+3. Use swagger to call application endpoints. All apps expose a Swagger UI at `/swagger`. (pending)
