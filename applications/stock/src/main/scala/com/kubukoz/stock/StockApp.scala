@@ -16,17 +16,9 @@ import fs2.kafka.vulcan._
 import cats.mtl.ApplicativeAsk
 import skunk.Session
 import io.estatico.newtype.macros.newtype
-import natchez.Trace
-import cats.data.Kleisli
 import cats.mtl.DefaultApplicativeAsk
 import skunk.codec.numeric
-import com.kubukoz.util.skunk.SkunkMiddleware
-import cats.mtl.FunctorTell
-import com.kubukoz.util.KafkaUtils.WriterSenderMiddleware
-import shapeless.HNil
-import shapeless.::
-import cats.data.OptionT
-import cats.mtl.DefaultFunctorTell
+import cats.tagless.autoFunctorK
 
 object StockApp extends IOApp {
 
@@ -37,6 +29,8 @@ object StockApp extends IOApp {
       val ask: F[B]                   = fa.reader(f)
     }
   }
+
+  import com.olegpy.meow.effects._
 
   def run(args: List[String]): IO[ExitCode] = {
     val avroSettings = AvroSettings(SchemaRegistryClientSettings[IO]("http://localhost:8081"))
@@ -50,72 +44,27 @@ object StockApp extends IOApp {
           )
       }
 
-    val _ = stockEventProducer //todo
-
-    import Trace.Implicits.noop //todo
-
-    import cats.mtl.instances.all._
-    import com.olegpy.meow.hierarchy.deriveApplicativeAsk
-
-    type Deps          = Session[IO] :: FunctorTell[IO, Chain[StockEvent]] :: HNil
-    type DepsNoSession = FunctorTell[IO, Chain[StockEvent]] :: HNil
-
-    type Eff[A] = Kleisli[IO, Deps, A]
-
-    type EffNoSession[A] = Kleisli[IO, DepsNoSession, A]
-
-    implicit val askTellFromEff: StockEvent.Write[Eff] = new DefaultFunctorTell[Eff, Chain[StockEvent]] {
-      val functor: Functor[Eff]                      = Functor[Eff]
-      def tell(events: Chain[StockEvent]): Eff[Unit] = Kleisli(_.tail.head.tell(events))
-    }
-    implicit val askF: ApplicativeAsk[Eff, Session[Eff]] = ApplicativeAsk[Eff, Deps].map(_.head.mapK(Kleisli.liftK))
-    implicit val consoleEff: Console[Eff]                = SyncConsole.stdio[Eff]
-    implicit val repository: StockRepository[Eff]        = StockRepository.instance[Eff]
-    val service                                          = StockService.instance[Eff]
-    val routes                                           = StockRoutes.make(service)
-
-    def skunkMiddleware(sessionPool: Resource[IO, Session[IO]]): HttpRoutes[Eff] => HttpRoutes[EffNoSession] =
-      routes =>
-        Kleisli { request =>
-          OptionT {
-            sessionPool.mapK[EffNoSession](Kleisli.liftK).use { session =>
-              SkunkMiddleware
-                .imapKRoutes(routes)(λ[Eff ~> EffNoSession](_.local(session :: _)))(
-                  λ[EffNoSession ~> Eff](_.local(_.tail))
-                )
-                .run(request)
-                .value
-            }
-          }
-        }
-
-    type EffJustWrite[A] = Kleisli[IO, FunctorTell[IO, Chain[StockEvent]], A]
-
-    def writerSenderMiddleware(send: Chain[StockEvent] => IO[Unit]): HttpRoutes[EffNoSession] => HttpRoutes[IO] =
-      routes =>
-        WriterSenderMiddleware(send).apply(
-          SkunkMiddleware.imapKRoutes(routes)(λ[EffNoSession ~> EffJustWrite](_.local(_ :: HNil)))(
-            λ[EffJustWrite ~> EffNoSession](_.local(_.head))
-          )
-        )
+    import natchez.Trace.Implicits.noop
 
     val app: Resource[IO, Unit] = {
       for {
         producer    <- stockEventProducer
         sessionPool <- Session.pooled[IO]("localhost", user = "postgres", database = "postgres", max = 10)
-        _ <- BlazeServerBuilder[IO]
-          .withHttpApp(
-            writerSenderMiddleware(sendMessages(producer))
-              .compose(skunkMiddleware(sessionPool))
-              .apply(routes)
-              .orNotFound
-          )
-          .resource
+        routes = StockRoutes.make[IO](sessionPool, senderResource(producer))
+        _ <- BlazeServerBuilder[IO].withHttpApp(routes.orNotFound).resource
       } yield ()
     }
 
     app.use(_ => IO.never)
   } as ExitCode.Success
+
+  def senderResource[F[_]: Sync](producer: KafkaProducer[F, Unit, StockEvent]): Resource[F, StockEvent.Write[F]] =
+    Resource
+      .makeCase(Ref[F].of(Chain.empty[StockEvent])) {
+        case (ref, ExitCase.Completed) => ref.get.flatMap(sendMessages(producer))
+        case _                         => ().pure[F]
+      }
+      .map(_.tellInstance)
 
   def sendMessages[F[_]: FlatMap](producer: KafkaProducer[F, Unit, StockEvent])(events: Chain[StockEvent]): F[Unit] = {
     val messages = ProducerRecords(events.map(event => ProducerRecord("stock-event", (), event)))
@@ -152,18 +101,36 @@ object StockService {
 
 object StockRoutes {
 
-  def make[F[_]: Sync](stockService: StockService[F]): HttpRoutes[F] = {
+  type MessageSenderResource[F[_]] = Resource[F, StockEvent.Write[F]]
+
+  def make[F[_]: Sync](
+    sessionPool: Resource[F, Session[F]],
+    messageSender: MessageSenderResource[F]
+  ): HttpRoutes[F] = {
     val dsl = new Http4sDsl[F] {}
     import dsl._
 
+    val mkStockService = (sessionPool, messageSender).tupled.map {
+      case (session, sender) =>
+        implicit val senderImplicit                         = sender
+        implicit val askSession: SessionUtils.AskSession[F] = ApplicativeAsk.const(session)
+
+        implicit val repo = StockRepository.instance[F]
+
+        StockService.instance[F]
+    }
+
     HttpRoutes.of[F] {
       case POST -> Root / "create" / tag =>
-        stockService.create(CreateStock(tag)) *> Created()
+        mkStockService.use(_.create(CreateStock(tag)) *> Created())
     }
   }
 }
 
+import java.lang.SuppressWarnings
+
 @finalAlg
+@autoFunctorK
 trait StockRepository[F[_]] {
   def saveStock(stock: Stock): F[Stock.Id]
 }
@@ -171,14 +138,14 @@ trait StockRepository[F[_]] {
 object StockRepository {
   import SessionUtils._
 
-  def instance[F[_]: Monad: Console](implicit getSession: AskSession[F]): StockRepository[F] = {
+  def instance[F[_]: Monad](implicit getSession: AskSession[F]): StockRepository[F] = {
     new StockRepository[F] {
 
       def saveStock(stock: Stock): F[Stock.Id] = getSession.ask.flatMap { ses =>
         import skunk.implicits._
 
         val action: F[Unit] =
-          ses.execute(sql"select 1".query(numeric.int4)).flatMap(Console[F].putStrLn(_))
+          ses.execute(sql"select 1".query(numeric.int4)).void
 
         action.as(Stock.Id(0))
       }
