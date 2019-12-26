@@ -20,8 +20,9 @@ import natchez.Trace.Implicits.noop
 import com.kubukoz.util.KafkaUtils
 import io.chrisdavenport.log4cats.slf4j.Slf4jLogger
 import skunk.codec.text
-import skunk.Codec
 import io.circe.generic.extras.Configuration
+import io.circe.Decoder
+import io.circe.Encoder
 
 object StockApp extends IOApp {
   import KafkaStuff._
@@ -34,10 +35,10 @@ object StockApp extends IOApp {
   val server =
     for {
       sessionPool <- Session.pooled[IO]("localhost", user = "postgres", database = "postgres", max = 10)
-      (producer: StockEvent.WriteResource[IO]) = KafkaUtils.senderResource(logMessages)
-      // (producer: StockEvent.WriteResource[IO]) <- stockEventProducer[IO]
-      //   .map(sendMessages(_) _)
-      //   .map(KafkaUtils.senderResource(_))
+      // (producer: StockEvent.WriteResource[IO]) = KafkaUtils.senderResource(logMessages)
+      (producer: StockEvent.WriteResource[IO]) <- stockEventProducer[IO]
+        .map(sendMessages(_) _)
+        .map(KafkaUtils.senderResource(_))
       routes = StockRoutes.make[IO](sessionPool.flatTap(_.transaction), producer)
       _ <- BlazeServerBuilder[IO].withHttpApp(routes.orNotFound).resource
     } yield ()
@@ -75,10 +76,13 @@ object domain {
 
     implicit val config = Configuration.default
 
-    final case class Id(value: Long) extends AnyVal
+    @newtype
+    final case class Id(value: Long)
 
     object Id {
-      implicit val codec: io.circe.Codec[Id] = deriveUnwrappedCodec
+
+      implicit val codec: io.circe.Codec[Id] =
+        io.circe.Codec.from(Decoder[Long].map(Id(_)), Encoder[Long].contramap(_.value))
     }
 
     def init(tag: String) = Stock(Id(0), tag)
@@ -118,7 +122,7 @@ object StockRepository {
 
   def instance[F[_]: BracketThrow](session: Session[F]): StockRepository[F] = {
     object codecs {
-      val stockId = numeric.int8.gimap[Stock.Id]
+      val stockId = numeric.int8.imap(Stock.Id(_))(_.value)
       val stock   = (stockId ~ text.text).gimap[Stock]
     }
 

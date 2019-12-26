@@ -6,12 +6,21 @@ import fs2.kafka.vulcan._
 import fs2.Stream
 import scala.concurrent.duration._
 import fs2.Pipe
+import cats.tagless.finalAlg
+import skunk.Session
+import skunk.codec.numeric
+import com.kubukoz.events.ReportEvent
+import cats.data.Chain
+import io.chrisdavenport.log4cats.Logger
+import io.chrisdavenport.log4cats.slf4j.Slf4jLogger
 
 object ReportApp extends IOApp {
 
+  implicit val logger = Slf4jLogger.getLogger[IO]
+
   val avroSettings = AvroSettings(SchemaRegistryClientSettings[IO]("http://localhost:8081"))
 
-  def run(args: List[String]): IO[ExitCode] =
+  def eventStream(mkSession: Resource[IO, Session[IO]]) =
     Stream
       .eval(avroDeserializer[StockEvent].using(avroSettings).forValue)
       .map { implicit ds =>
@@ -24,24 +33,40 @@ object ReportApp extends IOApp {
       .flatMap(consumerStream(_))
       .evalTap(_.subscribeTo("stock-event"))
       .flatMap(_.stream)
-      .evalMap(handleDecodedEvent(outTopic = "demo")(handler))
+      .evalMap(handleDecodedEvent(outTopic = "report-event") { event =>
+        mkSession.map(ReportRepository.instance(_)).use { implicit repo =>
+          Ref[IO]
+            .of(Chain.empty[ReportEvent])
+            .flatTap {
+              import com.olegpy.meow.effects._
+              _.runTell { implicit tell =>
+                ReportService.instance[IO].handleStockEvent(event)
+              }
+            }
+            .flatMap(_.get)
+        }
+      })
       .groupWithin(100, 100.millis)
       .map(TransactionalProducerRecords(_))
       .through {
-        transactionalProduce(
-          TransactionalProducerSettings(
-            "report-consumer-stock-event",
-            ProducerSettings[IO, Unit, String].withRetries(10).withBootstrapServers("localhost:9092")
-          ).withTransactionTimeout(5.seconds)
-        )
-      }
-      .compile
-      .drain as ExitCode.Success
+        val pipeIO = avroSerializer[ReportEvent].using(avroSettings).forValue.map { implicit reportSerializer =>
+          transactionalProduce(
+            TransactionalProducerSettings(
+              "report-consumer-stock-event",
+              ProducerSettings[IO, Unit, ReportEvent].withRetries(10).withBootstrapServers("localhost:9092")
+            ).withTransactionTimeout(5.seconds)
+          )
+        }
 
-  // Commit DB transaction here for at least once processing.
-  def handler(event: StockEvent): IO[List[String]] =
-    IO(println(event)) *>
-      IO.pure(List("foo", "bar", "bazinga", event.toString))
+        stream => Stream.force(pipeIO.map(stream.through))
+      }
+
+  import natchez.Trace.Implicits.noop
+
+  def run(args: List[String]): IO[ExitCode] =
+    Session.pooled[IO]("localhost", user = "postgres", database = "postgres", max = 10).use { sessionPool =>
+      eventStream(sessionPool.flatTap(_.transaction)).compile.drain as ExitCode.Success
+    }
 
   def handleDecodedEvent[F[_]: Functor, G[+_]: Foldable: Functor, K, Event, OutEvent](
     outTopic: String
@@ -54,8 +79,41 @@ object ReportApp extends IOApp {
     }
   }
 
-  def transactionalProduce[F[_]: ConcurrentEffect: ContextShift, K, V, P](
+  def transactionalProduce[F[_]: ConcurrentEffect: ContextShift, K, V](
     settings: TransactionalProducerSettings[F, K, V]
-  ): Pipe[F, TransactionalProducerRecords[F, K, V, P], ProducerResult[K, V, P]] =
+  ): Pipe[F, TransactionalProducerRecords[F, K, V, Unit], ProducerResult[K, V, Unit]] =
     records => transactionalProducerStream(settings).flatMap(producer => records.evalMap(producer.produce))
+}
+
+@finalAlg
+trait ReportService[F[_]] {
+  def handleStockEvent(event: StockEvent): F[Unit]
+}
+
+object ReportService {
+
+  def instance[F[_]: ReportRepository: ReportEvent.Write: Logger: Monad]: ReportService[F] = new ReportService[F] {
+
+    def handleStockEvent(event: StockEvent): F[Unit] =
+      ReportRepository[F]
+        .createReport(Report()) <* ReportEvent.Write[F].tellOne(ReportEvent.Created("foo")) <* Logger[F].info(
+        "Handled event " + event
+      )
+  }
+}
+
+final case class Report()
+
+@finalAlg
+trait ReportRepository[F[_]] {
+  def createReport(report: Report): F[Unit]
+}
+
+object ReportRepository {
+
+  def instance[F[_]: Functor](session: Session[F]): ReportRepository[F] = new ReportRepository[F] {
+    import skunk.implicits._
+
+    def createReport(report: Report): F[Unit] = session.execute(sql"select 1".query(numeric.int4)).void
+  }
 }
