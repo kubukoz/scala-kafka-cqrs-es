@@ -37,21 +37,22 @@ val commonSettings = Seq(
   updateOptions := updateOptions.value.withGigahorse(false),
   resolvers += "confluent" at "https://packages.confluent.io/maven/",
   libraryDependencies ++= Seq(
-    "org.http4s"     %% "http4s-blaze-server"  % "0.21.0-M5",
-    "org.http4s"     %% "http4s-dsl"           % "0.21.0-M5",
-    "org.http4s"     %% "http4s-circe"         % "0.21.0-M5",
-    "dev.profunktor" %% "console4cats"         % "0.8.0",
-    "ch.qos.logback" % "logback-classic"       % "1.2.3",
-    "org.typelevel"  %% "cats-tagless-macros"  % "0.10",
-    "io.circe"       %% "circe-generic-extras" % "0.12.2",
-    "com.olegpy"     %% "meow-mtl-core"        % "0.4.0",
-    "com.olegpy"     %% "meow-mtl-effects"     % "0.4.0",
-    "com.ovoenergy"  %% "fs2-kafka-vulcan"     % "0.20.2",
-    "com.ovoenergy"  %% "vulcan-generic"       % "0.3.1",
-    "org.tpolecat"   %% "skunk-core"           % "0.0.7",
-    "org.tpolecat"   %% "skunk-circe"          % "0.0.7",
-    "io.estatico"    %% "newtype"              % "0.4.3",
-    "org.scalatest"  %% "scalatest"            % "3.1.0" % Test
+    "org.http4s"        %% "http4s-blaze-server"  % "0.21.0-M5",
+    "org.http4s"        %% "http4s-dsl"           % "0.21.0-M5",
+    "org.http4s"        %% "http4s-circe"         % "0.21.0-M5",
+    "dev.profunktor"    %% "console4cats"         % "0.8.0",
+    "ch.qos.logback"    % "logback-classic"       % "1.2.3",
+    "io.chrisdavenport" %% "log4cats-slf4j"       % "1.0.1",
+    "org.typelevel"     %% "cats-tagless-macros"  % "0.10",
+    "io.circe"          %% "circe-generic-extras" % "0.12.2",
+    "com.olegpy"        %% "meow-mtl-core"        % "0.4.0",
+    "com.olegpy"        %% "meow-mtl-effects"     % "0.4.0",
+    "com.ovoenergy"     %% "fs2-kafka-vulcan"     % "0.20.2",
+    "com.ovoenergy"     %% "vulcan-generic"       % "0.3.1",
+    "org.tpolecat"      %% "skunk-core"           % "0.0.7",
+    "org.tpolecat"      %% "skunk-circe"          % "0.0.7",
+    "io.estatico"       %% "newtype"              % "0.4.3",
+    "org.scalatest"     %% "scalatest"            % "3.1.0" % Test
   ) ++ compilerPlugins
 )
 

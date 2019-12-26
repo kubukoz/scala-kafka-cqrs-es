@@ -18,15 +18,27 @@ import io.estatico.newtype.macros.newtype
 import skunk.codec.numeric
 import natchez.Trace.Implicits.noop
 import com.kubukoz.util.KafkaUtils
+import io.chrisdavenport.log4cats.slf4j.Slf4jLogger
+import skunk.codec.text
+import skunk.Codec
+import io.circe.generic.extras.Configuration
 
 object StockApp extends IOApp {
   import KafkaStuff._
 
+  val logger = Slf4jLogger.getLogger[IO]
+
+  def logMessages(events: Chain[StockEvent]): IO[Unit] =
+    logger.info("Sending messages: " + events.map(_.toString).mkString_(", "))
+
   val server =
     for {
-      producer    <- stockEventProducer[IO]
       sessionPool <- Session.pooled[IO]("localhost", user = "postgres", database = "postgres", max = 10)
-      routes = StockRoutes.make[IO](sessionPool, KafkaUtils.senderResource(sendMessages(producer)))
+      (producer: StockEvent.WriteResource[IO]) = KafkaUtils.senderResource(logMessages)
+      // (producer: StockEvent.WriteResource[IO]) <- stockEventProducer[IO]
+      //   .map(sendMessages(_) _)
+      //   .map(KafkaUtils.senderResource(_))
+      routes = StockRoutes.make[IO](sessionPool.flatTap(_.transaction), producer)
       _ <- BlazeServerBuilder[IO].withHttpApp(routes.orNotFound).resource
     } yield ()
 
@@ -59,11 +71,19 @@ object domain {
   final case class Stock(id: Stock.Id, tag: String)
 
   object Stock {
+    import io.circe.generic.extras.semiauto._
 
-    @newtype
-    final case class Id(value: Long)
+    implicit val config = Configuration.default
+
+    final case class Id(value: Long) extends AnyVal
+
+    object Id {
+      implicit val codec: io.circe.Codec[Id] = deriveUnwrappedCodec
+    }
 
     def init(tag: String) = Stock(Id(0), tag)
+
+    implicit val codec: io.circe.Codec[Stock] = deriveConfiguredCodec
   }
 }
 
@@ -72,6 +92,7 @@ import domain._
 @finalAlg
 trait StockService[F[_]] {
   def create(stock: CreateStock): F[Stock.Id]
+  def find(id: Stock.Id): F[Option[Stock]]
 }
 
 object StockService {
@@ -80,32 +101,52 @@ object StockService {
 
     def create(stock: CreateStock): F[Stock.Id] =
       StockRepository[F].saveStock(Stock.init(stock.tag)) <* StockEvent.Write[F].tellOne(StockEvent.Created(stock.tag))
+
+    def find(id: Stock.Id): F[Option[Stock]] = StockRepository[F].retrieveStock(id)
   }
 }
 
 @finalAlg
 trait StockRepository[F[_]] {
   def saveStock(stock: Stock): F[Stock.Id]
+  def retrieveStock(id: Stock.Id): F[Option[Stock]]
 }
 
 object StockRepository {
 
-  def instance[F[_]: Monad](session: Session[F]): StockRepository[F] = {
+  type BracketThrow[F[_]] = Bracket[F, Throwable]
+
+  def instance[F[_]: BracketThrow](session: Session[F]): StockRepository[F] = {
+    object codecs {
+      val stockId = numeric.int8.gimap[Stock.Id]
+      val stock   = (stockId ~ text.text).gimap[Stock]
+    }
+
     new StockRepository[F] {
 
       def saveStock(stock: Stock): F[Stock.Id] = {
         import skunk.implicits._
 
         val action: F[Unit] =
-          session.execute(sql"select 1".query(numeric.int4)).void
+          session.prepare(sql"insert into stock(id, tag) values(${codecs.stock})".command).use(_.execute(stock)).void
 
         action.as(Stock.Id(0))
+      }
+
+      def retrieveStock(id: Stock.Id): F[Option[Stock]] = {
+        import skunk.implicits._
+
+        session
+          .prepare(sql"select id, tag from stock where id = ${codecs.stockId}".query(codecs.stock))
+          .use(_.option(id))
       }
     }
   }
 }
 
 object StockRoutes {
+
+  import org.http4s.circe.CirceEntityCodec._
 
   def make[F[_]: Sync](
     //parameters being resources are request-scoped
@@ -128,6 +169,18 @@ object StockRoutes {
     HttpRoutes.of[F] {
       case POST -> Root / "create" / tag =>
         mkStockService.use(_.create(CreateStock(tag)) *> Created())
+
+      case GET -> Root / "findById" / id =>
+        Sync[F]
+          .catchNonFatal(id.toLong)
+          .map(Stock.Id(_))
+          .flatMap { id =>
+            mkStockService.use(_.find(id))
+          }
+          .flatMap {
+            case None        => NotFound()
+            case Some(stock) => Ok(stock)
+          }
     }
   }
 }
