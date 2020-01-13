@@ -23,14 +23,76 @@ import skunk.codec.text
 import io.circe.generic.extras.Configuration
 import io.circe.Decoder
 import io.circe.Encoder
+import cats.data.Kleisli
+import cats.mtl.FunctorTell
+import cats.mtl.DefaultFunctorTell
+import com.kubukoz.util.skunk.SkunkMiddleware
+import cats.mtl.ApplicativeAsk
+import cats.mtl.DefaultApplicativeAsk
 
 object StockApp extends IOApp {
   import KafkaStuff._
+
+  implicit class MapKFunctorTell[F[_], A](ft: FunctorTell[F, A]) {
+
+    def mapK[G[_]: Functor](fk: F ~> G): FunctorTell[G, A] = new DefaultFunctorTell[G, A] {
+      val functor: Functor[G] = Functor[G]
+      def tell(l: A): G[Unit] = fk(ft.tell(l))
+    }
+  }
+
+  implicit def applicativeAskFunctor[F[_]]: Functor[ApplicativeAsk[F, *]] = new Functor[ApplicativeAsk[F, *]] {
+
+    def map[A, B](fa: ApplicativeAsk[F, A])(f: A => B): ApplicativeAsk[F, B] = new DefaultApplicativeAsk[F, B] {
+      val applicative: Applicative[F] = fa.applicative
+      val ask: F[B]                   = fa.reader(f)
+    }
+  }
+
+  implicit final class ResourceApplyKleisli[F[_], A](private val res: Resource[F, A]) extends AnyVal {
+
+    def runKleisli(implicit B: Bracket[F, Throwable]): Kleisli[F, A, *] ~> F =
+      λ[Kleisli[F, A, *] ~> F](eff => res.use(eff.run))
+  }
 
   val logger = Slf4jLogger.getLogger[IO]
 
   def logMessages(events: Chain[StockEvent]): IO[Unit] =
     logger.info("Sending messages: " + events.map(_.toString).mkString_(", "))
+
+  final case class Context[F[_]](session: Session[F]) {
+
+    def mapK[G[_]: Applicative: Defer](fk: F ~> G)(implicit F: Bracket[F, Throwable]): Context[G] = {
+      Context(session.mapK(fk))
+    }
+  }
+
+  object Context {
+    type Ask[F[_]] = ApplicativeAsk[F, Context[F]]
+    def ask[F[_]](implicit F: Ask[F]): F[Context[F]] = F.ask
+  }
+
+  //todo fiddle around with Sync constraint
+  implicit def askContextInEff[F[_]: Sync, R](
+    implicit askF: ApplicativeAsk[Kleisli[F, R, *], Context[F]]
+  ): ApplicativeAsk[Kleisli[F, R, *], Context[Kleisli[F, R, *]]] = askF.map(_.mapK(Kleisli.liftK))
+
+  type Eff[A] = Kleisli[IO, Context[IO], A]
+
+  val ioToEff: IO ~> Eff                                  = Kleisli.liftK
+  def applyEff(ctx: Resource[IO, Context[IO]]): Eff ~> IO = ctx.runKleisli
+
+  def runContext(contextResource: Resource[IO, Context[IO]])(routesEff: HttpRoutes[Eff]): HttpRoutes[IO] =
+    SkunkMiddleware.imapKRoutes(routesEff)(applyEff(contextResource))(ioToEff)
+
+  import com.olegpy.meow.hierarchy._
+  import cats.mtl.instances.all._
+
+  def mkRoutes[F[_]: Sync](
+    producer: Resource[F, FunctorTell[F, Chain[StockEvent]]]
+  )(implicit ask: ApplicativeAsk[F, Context[F]]) = {
+    StockRoutes.make[F](producer)
+  }
 
   val server =
     for {
@@ -39,8 +101,9 @@ object StockApp extends IOApp {
       (producer: StockEvent.WriteResource[IO]) <- stockEventProducer[IO]
         .map(sendMessages(_) _)
         .map(KafkaUtils.senderResource(_))
-      routes = StockRoutes.make[IO](sessionPool.flatTap(_.transaction), producer)
-      _ <- BlazeServerBuilder[IO].withHttpApp(routes.orNotFound).resource
+      routes          = mkRoutes[Eff](producer.mapK(ioToEff).map(_.mapK(ioToEff)))
+      contextResource = sessionPool.flatTap(_.transaction).map(xa => Context(xa))
+      _ <- BlazeServerBuilder[IO].withHttpApp(runContext(contextResource)(routes).orNotFound).resource
     } yield ()
 
   def run(args: List[String]): IO[ExitCode] = server.use(_ => IO.never)
@@ -117,10 +180,12 @@ trait StockRepository[F[_]] {
 }
 
 object StockRepository {
+  type SessionAsk[F[_]] = ApplicativeAsk[F, Session[F]]
+  def askSession[F[_]](implicit F: SessionAsk[F]): F[Session[F]] = F.ask
 
   type BracketThrow[F[_]] = Bracket[F, Throwable]
 
-  def instance[F[_]: BracketThrow](session: Session[F]): StockRepository[F] = {
+  def instance[F[_]: BracketThrow: SessionAsk]: StockRepository[F] = {
     object codecs {
       val stockId = numeric.int8.imap(Stock.Id(_))(_.value)
       val stock   = (stockId ~ text.text).gimap[Stock]
@@ -128,7 +193,7 @@ object StockRepository {
 
     new StockRepository[F] {
 
-      def saveStock(stock: Stock): F[Stock.Id] = {
+      def saveStock(stock: Stock): F[Stock.Id] = askSession[F].flatMap { session =>
         import skunk.implicits._
 
         val action: F[Unit] =
@@ -137,7 +202,7 @@ object StockRepository {
         action.as(Stock.Id(0))
       }
 
-      def retrieveStock(id: Stock.Id): F[Option[Stock]] = {
+      def retrieveStock(id: Stock.Id): F[Option[Stock]] = askSession[F].flatMap { session =>
         import skunk.implicits._
 
         session
@@ -152,22 +217,17 @@ object StockRoutes {
 
   import org.http4s.circe.CirceEntityCodec._
 
-  def make[F[_]: Sync](
-    //parameters being resources are request-scoped
-    sessionPool: Resource[F, Session[F]],
+  def make[F[_]: Sync: StockRepository.SessionAsk](
     messageSender: StockEvent.WriteResource[F]
   ): HttpRoutes[F] = {
     val dsl = new Http4sDsl[F] {}
     import dsl._
 
+    implicit val repo = StockRepository.instance[F]
+
     val mkStockService =
-      (sessionPool, messageSender).tupled.map {
-        case (session, sender) =>
-          implicit val localSender = sender
-
-          implicit val repo = StockRepository.instance(session)
-
-          StockService.instance[F]
+      messageSender.map { implicit sender =>
+        StockService.instance[F]
       }
 
     HttpRoutes.of[F] {
