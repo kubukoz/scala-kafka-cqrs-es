@@ -29,6 +29,7 @@ import cats.mtl.DefaultFunctorTell
 import com.kubukoz.util.skunk.SkunkMiddleware
 import cats.mtl.ApplicativeAsk
 import cats.mtl.DefaultApplicativeAsk
+import cats.data.OptionT
 
 object StockApp extends IOApp {
   import KafkaStuff._
@@ -60,10 +61,10 @@ object StockApp extends IOApp {
   def logMessages(events: Chain[StockEvent]): IO[Unit] =
     logger.info("Sending messages: " + events.map(_.toString).mkString_(", "))
 
-  final case class Context[F[_]](session: Session[F]) {
+  final case class Context[F[_]](session: Session[F], eventTell: FunctorTell[F, Chain[StockEvent]]) {
 
     def mapK[G[_]: Applicative: Defer](fk: F ~> G)(implicit F: Bracket[F, Throwable]): Context[G] = {
-      Context(session.mapK(fk))
+      Context(session.mapK(fk), eventTell.mapK(fk))
     }
   }
 
@@ -77,22 +78,36 @@ object StockApp extends IOApp {
     implicit askF: ApplicativeAsk[Kleisli[F, R, *], Context[F]]
   ): ApplicativeAsk[Kleisli[F, R, *], Context[Kleisli[F, R, *]]] = askF.map(_.mapK(Kleisli.liftK))
 
+  implicit def deriveFunctorTellFromAskOftell[F[_]: FlatMap, A](
+    implicit ask: ApplicativeAsk[F, FunctorTell[F, A]]
+  ): FunctorTell[F, A] = new DefaultFunctorTell[F, A] {
+    val functor: Functor[F] = ask.applicative
+    def tell(l: A): F[Unit] = ask.ask.flatMap(_.tell(l))
+  }
+
   type Eff[A] = Kleisli[IO, Context[IO], A]
 
   val ioToEff: IO ~> Eff                                  = Kleisli.liftK
+  def applyEffPure(ctx: Context[IO]): Eff ~> IO           = Kleisli.applyK(ctx)
   def applyEff(ctx: Resource[IO, Context[IO]]): Eff ~> IO = ctx.runKleisli
 
+  // Shady shit, don't touch
+  // Basically: run the request handling function in one resource, then run the response stream in another one.
+  // http4s's API doesn't allow mixing them that easily
+  // (there could be some plumbing done with resource.allocated and friends but it's too shady even for me)
+  // so here's that
   def runContext(contextResource: Resource[IO, Context[IO]])(routesEff: HttpRoutes[Eff]): HttpRoutes[IO] =
-    SkunkMiddleware.imapKRoutes(routesEff)(applyEff(contextResource))(ioToEff)
+    routesEff.local[Request[IO]](_.mapK(ioToEff)).mapF(_.mapK(applyEff(contextResource))).map { response =>
+      val transactedBody =
+        fs2.Stream.resource(contextResource).map(applyEffPure).flatMap(response.body.translateInterruptible(_))
+
+      response.copy(body = transactedBody)
+    }
 
   import com.olegpy.meow.hierarchy._
   import cats.mtl.instances.all._
 
-  def mkRoutes[F[_]: Sync](
-    producer: Resource[F, FunctorTell[F, Chain[StockEvent]]]
-  )(implicit ask: ApplicativeAsk[F, Context[F]]) = {
-    StockRoutes.make[F](producer)
-  }
+  def mkRoutes[F[_]: Sync: Context.Ask] = StockRoutes.make[F]
 
   val server =
     for {
@@ -101,8 +116,8 @@ object StockApp extends IOApp {
       (producer: StockEvent.WriteResource[IO]) <- stockEventProducer[IO]
         .map(sendMessages(_) _)
         .map(KafkaUtils.senderResource(_))
-      routes          = mkRoutes[Eff](producer.mapK(ioToEff).map(_.mapK(ioToEff)))
-      contextResource = sessionPool.flatTap(_.transaction).map(xa => Context(xa))
+      routes          = mkRoutes[Eff]
+      contextResource = (sessionPool.flatTap(_.transaction), producer).mapN(Context[IO])
       _ <- BlazeServerBuilder[IO].withHttpApp(runContext(contextResource)(routes).orNotFound).resource
     } yield ()
 
@@ -217,29 +232,25 @@ object StockRoutes {
 
   import org.http4s.circe.CirceEntityCodec._
 
-  def make[F[_]: Sync: StockRepository.SessionAsk](
-    messageSender: StockEvent.WriteResource[F]
-  ): HttpRoutes[F] = {
+  def make[F[_]: Sync: StockRepository.SessionAsk: StockEvent.Write]: HttpRoutes[F] = {
     val dsl = new Http4sDsl[F] {}
     import dsl._
 
     implicit val repo = StockRepository.instance[F]
 
-    val mkStockService =
-      messageSender.map { implicit sender =>
-        StockService.instance[F]
-      }
+    val stockService =
+      StockService.instance[F]
 
     HttpRoutes.of[F] {
       case POST -> Root / "create" / tag =>
-        mkStockService.use(_.create(CreateStock(tag)) *> Created())
+        stockService.create(CreateStock(tag)) *> Created()
 
       case GET -> Root / "findById" / id =>
         Sync[F]
           .catchNonFatal(id.toLong)
           .map(Stock.Id(_))
           .flatMap { id =>
-            mkStockService.use(_.find(id))
+            stockService.find(id)
           }
           .flatMap {
             case None        => NotFound()
