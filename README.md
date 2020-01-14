@@ -25,7 +25,7 @@ The following applications are available:
 - builds its own read model of stock for reports (pending)
 - builds reports (pending)
 - sends `ReportEvent.Created` to `report-event` topic (pending)
-- serves reports over HTTP (pending)
+- serves reports and historical versions thereof over HTTP (pending)
 
 ### Notification Service (pending)
 
