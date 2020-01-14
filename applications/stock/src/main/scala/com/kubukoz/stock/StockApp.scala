@@ -18,111 +18,32 @@ import io.estatico.newtype.macros.newtype
 import skunk.codec.numeric
 import natchez.Trace.Implicits.noop
 import com.kubukoz.util.KafkaUtils
-import io.chrisdavenport.log4cats.slf4j.Slf4jLogger
 import skunk.codec.text
 import io.circe.generic.extras.Configuration
 import io.circe.Decoder
 import io.circe.Encoder
-import cats.data.Kleisli
-import cats.mtl.FunctorTell
-import cats.mtl.DefaultFunctorTell
-import com.kubukoz.util.skunk.SkunkMiddleware
 import cats.mtl.ApplicativeAsk
-import cats.mtl.DefaultApplicativeAsk
-import cats.data.OptionT
 
 object StockApp extends IOApp {
   import KafkaStuff._
 
-  implicit class MapKFunctorTell[F[_], A](ft: FunctorTell[F, A]) {
-
-    def mapK[G[_]: Functor](fk: F ~> G): FunctorTell[G, A] = new DefaultFunctorTell[G, A] {
-      val functor: Functor[G] = Functor[G]
-      def tell(l: A): G[Unit] = fk(ft.tell(l))
-    }
-  }
-
-  implicit def applicativeAskFunctor[F[_]]: Functor[ApplicativeAsk[F, *]] = new Functor[ApplicativeAsk[F, *]] {
-
-    def map[A, B](fa: ApplicativeAsk[F, A])(f: A => B): ApplicativeAsk[F, B] = new DefaultApplicativeAsk[F, B] {
-      val applicative: Applicative[F] = fa.applicative
-      val ask: F[B]                   = fa.reader(f)
-    }
-  }
-
-  implicit final class ResourceApplyKleisli[F[_], A](private val res: Resource[F, A]) extends AnyVal {
-
-    def runKleisli(implicit B: Bracket[F, Throwable]): Kleisli[F, A, *] ~> F =
-      λ[Kleisli[F, A, *] ~> F](eff => res.use(eff.run))
-  }
-
-  val logger = Slf4jLogger.getLogger[IO]
-
-  def logMessages(events: Chain[StockEvent]): IO[Unit] =
-    logger.info("Sending messages: " + events.map(_.toString).mkString_(", "))
-
-  final case class Context[F[_]](session: Session[F], eventTell: FunctorTell[F, Chain[StockEvent]]) {
-
-    def mapK[G[_]: Applicative: Defer](fk: F ~> G)(implicit F: Bracket[F, Throwable]): Context[G] = {
-      Context(session.mapK(fk), eventTell.mapK(fk))
-    }
-  }
-
-  object Context {
-    type Ask[F[_]] = ApplicativeAsk[F, Context[F]]
-    def ask[F[_]](implicit F: Ask[F]): F[Context[F]] = F.ask
-  }
-
-  //todo fiddle around with Sync constraint
-  implicit def askContextInEff[F[_]: Sync, R](
-    implicit askF: ApplicativeAsk[Kleisli[F, R, *], Context[F]]
-  ): ApplicativeAsk[Kleisli[F, R, *], Context[Kleisli[F, R, *]]] = askF.map(_.mapK(Kleisli.liftK))
-
-  implicit def deriveFunctorTellFromAskOftell[F[_]: FlatMap, A](
-    implicit ask: ApplicativeAsk[F, FunctorTell[F, A]]
-  ): FunctorTell[F, A] = new DefaultFunctorTell[F, A] {
-    val functor: Functor[F] = ask.applicative
-    def tell(l: A): F[Unit] = ask.ask.flatMap(_.tell(l))
-  }
-
-  type Eff[A] = Kleisli[IO, Context[IO], A]
-
-  val ioToEff: IO ~> Eff                                  = Kleisli.liftK
-  def applyEffPure(ctx: Context[IO]): Eff ~> IO           = Kleisli.applyK(ctx)
-  def applyEff(ctx: Resource[IO, Context[IO]]): Eff ~> IO = ctx.runKleisli
-
-  // Shady shit, don't touch
-  // Basically: run the request handling function in one resource, then run the response stream in another one.
-  // http4s's API doesn't allow mixing them that easily
-  // (there could be some plumbing done with resource.allocated and friends but it's too shady even for me)
-  // so here's that
-  def runContext(contextResource: Resource[IO, Context[IO]])(routesEff: HttpRoutes[Eff]): HttpRoutes[IO] =
-    routesEff.local[Request[IO]](_.mapK(ioToEff)).mapF(_.mapK(applyEff(contextResource))).map { response =>
-      val transactedBody =
-        fs2.Stream.resource(contextResource).map(applyEffPure).flatMap(response.body.translateInterruptible(_))
-
-      response.copy(body = transactedBody)
-    }
-
+  import Infrastructure._
   import com.olegpy.meow.hierarchy._
   import cats.mtl.instances.all._
 
   def mkRoutes[F[_]: Sync: Context.Ask] = StockRoutes.make[F]
 
+  val routes = mkRoutes[Eff]
+
   val server =
     for {
       sessionPool <- Session.pooled[IO]("localhost", user = "postgres", database = "postgres", max = 10)
-      // (producer: StockEvent.WriteResource[IO]) = KafkaUtils.senderResource(logMessages)
-      (producer: StockEvent.WriteResource[IO]) <- stockEventProducer[IO]
-        .map(sendMessages(_) _)
-        .map(KafkaUtils.senderResource(_))
-      routes          = mkRoutes[Eff]
+      producer    <- stockEventProducer[IO].map(sendMessages(_) _).map(KafkaUtils.senderResource(_))
       contextResource = (sessionPool.flatTap(_.transaction), producer).mapN(Context[IO])
       _ <- BlazeServerBuilder[IO].withHttpApp(runContext(contextResource)(routes).orNotFound).resource
     } yield ()
 
   def run(args: List[String]): IO[ExitCode] = server.use(_ => IO.never)
-
 }
 
 object KafkaStuff {
