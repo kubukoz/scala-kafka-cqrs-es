@@ -44,6 +44,9 @@ object ReportApp extends IOApp {
               }
             }
             .flatMap(_.get)
+            .handleErrorWith { e =>
+              logger.error(e)(s"Error while processing message [$event]").as(Chain.nil)
+            }
         }
       })
       .groupWithin(100, 100.millis)
