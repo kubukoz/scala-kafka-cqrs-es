@@ -49,6 +49,7 @@ val commonSettings = Seq(
     "com.olegpy"        %% "meow-mtl-effects"     % "0.4.0",
     "com.ovoenergy"     %% "fs2-kafka-vulcan"     % "0.20.2",
     "com.ovoenergy"     %% "vulcan-generic"       % "0.3.1",
+    "org.tpolecat"      %% "natchez-jaeger"       % "0.0.10",
     "org.tpolecat"      %% "skunk-core"           % "0.0.7",
     "org.tpolecat"      %% "skunk-circe"          % "0.0.7",
     "io.estatico"       %% "newtype"              % "0.4.3",

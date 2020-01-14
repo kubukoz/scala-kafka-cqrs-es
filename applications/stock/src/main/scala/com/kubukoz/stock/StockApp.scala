@@ -16,13 +16,21 @@ import fs2.kafka.vulcan._
 import skunk.Session
 import io.estatico.newtype.macros.newtype
 import skunk.codec.numeric
-import natchez.Trace.Implicits.noop
+import natchez.Trace
 import com.kubukoz.util.KafkaUtils
 import skunk.codec.text
 import io.circe.generic.extras.Configuration
 import io.circe.Decoder
 import io.circe.Encoder
 import cats.mtl.ApplicativeAsk
+import cats.mtl.FunctorTell
+import cats.data.Kleisli
+import natchez.Span
+import natchez.TraceValue
+import natchez.Kernel
+import natchez.jaeger.Jaeger
+import org.http4s.util.CaseInsensitiveString
+import natchez.EntryPoint
 
 object StockApp extends IOApp {
   import KafkaStuff._
@@ -31,16 +39,55 @@ object StockApp extends IOApp {
   import com.olegpy.meow.hierarchy._
   import cats.mtl.instances.all._
 
-  def mkRoutes[F[_]: Sync: Context.Ask] = StockRoutes.make[F]
+  def mkRoutes[F[_]: Sync: Context.Ask: Trace] = {
+    implicit val repo    = StockRepository.instance[F]
+    implicit val service = StockService.instance[F]
+    StockRoutes.make[F]
+  }
 
-  val routes = mkRoutes[Eff]
+  type Eff[A] = Kleisli[IO, Context[IO], A]
+
+  type EffTrace[A] = Kleisli[IO, Span[IO], A]
+
+  implicit val effTrace: Trace[Eff] = Trace.kleisliInstance[IO].lens(_.span, (ctx, span) => ctx.copy(span = span))
+  val routes                        = mkRoutes[Eff]
+
+  def requestToSpan[F[_]](ep: EntryPoint[F], r: Request[F]): Resource[F, Span[F]] = {
+    r.headers.get(CaseInsensitiveString("X-B3-TraceId")) match {
+      case Some(traceId) => ep.continue("request" + r.pathInfo, Kernel(Map("X-B3-TraceId" -> traceId.value)))
+      case None          => ep.root("request" + r.pathInfo)
+    }
+  }
 
   val server =
     for {
-      sessionPool <- Session.pooled[IO]("localhost", user = "postgres", database = "postgres", max = 10)
-      producer    <- stockEventProducer[IO].map(sendMessages(_) _).map(KafkaUtils.senderResource(_))
-      contextResource = (sessionPool.flatTap(_.transaction), producer).mapN(Context[IO])
-      _ <- BlazeServerBuilder[IO].withHttpApp(runContext(contextResource)(routes).orNotFound).resource
+      jaeger <- Jaeger.entryPoint[IO]("stock-app") { c =>
+        import io.jaegertracing.Configuration.SamplerConfiguration
+        import io.jaegertracing.Configuration.ReporterConfiguration
+        IO(c.withSampler(SamplerConfiguration.fromEnv).withReporter(ReporterConfiguration.fromEnv).getTracer())
+      }
+
+      //replace with session.pooled when https://github.com/tpolecat/skunk/issues/124 is resolved
+      sessionPool <- Resource.pure[IO, Resource[EffTrace, Session[EffTrace]]](
+        Session.single[EffTrace]("localhost", user = "postgres", database = "postgres")
+      )
+
+      producer <- stockEventProducer[IO].map(sendMessages(_) _).map(KafkaUtils.senderResource(_))
+
+      _ <- BlazeServerBuilder[IO]
+        .withHttpApp(HttpApp[IO] { req =>
+          val contextResource = requestToSpan(jaeger, req).flatMap { span =>
+            val tracedSession =
+              sessionPool.flatTap(_.transaction).mapK(Kleisli.applyK(span)).map(_.mapK(Kleisli.applyK(span)))
+
+            (tracedSession, producer).mapN(Context[IO](_, _, span))
+          }
+
+          contextResource.use { ctx =>
+            runContext(Resource.pure[IO, Context[IO]](ctx))(routes).orNotFound.run(req)
+          }
+        })
+        .resource
     } yield ()
 
   def run(args: List[String]): IO[ExitCode] = server.use(_ => IO.never)
@@ -100,10 +147,13 @@ trait StockService[F[_]] {
 
 object StockService {
 
-  def instance[F[_]: StockRepository: StockEvent.Write: FlatMap]: StockService[F] = new StockService[F] {
+  def instance[F[_]: StockRepository: StockEvent.Write: FlatMap: Trace]: StockService[F] = new StockService[F] {
 
     def create(stock: CreateStock): F[Stock.Id] =
-      StockRepository[F].saveStock(Stock.init(stock.tag)) <* StockEvent.Write[F].tellOne(StockEvent.Created(stock.tag))
+      Trace[F].span("bamboozled") {
+        StockRepository[F]
+          .saveStock(Stock.init(stock.tag)) <* StockEvent.Write[F].tellOne(StockEvent.Created(stock.tag))
+      }
 
     def find(id: Stock.Id): F[Option[Stock]] = StockRepository[F].retrieveStock(id)
   }
@@ -153,25 +203,20 @@ object StockRoutes {
 
   import org.http4s.circe.CirceEntityCodec._
 
-  def make[F[_]: Sync: StockRepository.SessionAsk: StockEvent.Write]: HttpRoutes[F] = {
+  def make[F[_]: Sync: StockService]: HttpRoutes[F] = {
     val dsl = new Http4sDsl[F] {}
     import dsl._
 
-    implicit val repo = StockRepository.instance[F]
-
-    val stockService =
-      StockService.instance[F]
-
     HttpRoutes.of[F] {
       case POST -> Root / "create" / tag =>
-        stockService.create(CreateStock(tag)) *> Created()
+        StockService[F].create(CreateStock(tag)) *> Created()
 
       case GET -> Root / "findById" / id =>
         Sync[F]
           .catchNonFatal(id.toLong)
           .map(Stock.Id(_))
           .flatMap { id =>
-            stockService.find(id)
+            StockService[F].find(id)
           }
           .flatMap {
             case None        => NotFound()

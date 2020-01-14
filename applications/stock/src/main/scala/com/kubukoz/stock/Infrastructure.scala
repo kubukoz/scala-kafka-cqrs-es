@@ -10,6 +10,9 @@ import cats.mtl.FunctorTell
 import cats.mtl.DefaultFunctorTell
 import cats.mtl.ApplicativeAsk
 import cats.mtl.DefaultApplicativeAsk
+import natchez.Span
+import natchez.TraceValue
+import natchez.Kernel
 
 //A bunch of weird things
 object Infrastructure {
@@ -46,6 +49,17 @@ object Infrastructure {
     def tell(l: A): F[Unit] = ask.ask.flatMap(_.tell(l))
   }
 
+  implicit class MapKSpan[F[_]](underlying: Span[F]) {
+
+    def mapK[G[_]: Defer: Applicative](
+      fk: F ~> G
+    )(implicit B: Bracket[F, Throwable]): Span[G] = new Span[G] {
+      def put(fields: (String, TraceValue)*): G[Unit] = fk(underlying.put(fields: _*))
+      def kernel: G[Kernel]                           = fk(underlying.kernel)
+      def span(name: String): Resource[G, Span[G]]    = underlying.span(name).mapK(fk).map(_.mapK(fk))
+    }
+  }
+
   /////////////////////
   /////////////////////
   /////////////////////
@@ -54,10 +68,10 @@ object Infrastructure {
   /////////////////////
   /////////////////////
 
-  final case class Context[F[_]](session: Session[F], eventTell: FunctorTell[F, Chain[StockEvent]]) {
+  final case class Context[F[_]](session: Session[F], eventTell: FunctorTell[F, Chain[StockEvent]], span: Span[F]) {
 
     def mapK[G[_]: Applicative: Defer](fk: F ~> G)(implicit F: Bracket[F, Throwable]): Context[G] = {
-      Context(session.mapK(fk), eventTell.mapK(fk))
+      Context(session.mapK(fk), eventTell.mapK(fk), span.mapK(fk))
     }
   }
 
@@ -72,8 +86,6 @@ object Infrastructure {
   implicit def askContextInEff[F[_]: Sync, R](
     implicit askF: ApplicativeAsk[Kleisli[F, R, *], Context[F]]
   ): ApplicativeAsk[Kleisli[F, R, *], Context[Kleisli[F, R, *]]] = askF.map(_.mapK(Kleisli.liftK))
-
-  type Eff[A] = Kleisli[IO, Context[IO], A]
 
   // Shady shit, don't touch
   // Basically: run the request handling function in one resource, then run the response stream in another one.
