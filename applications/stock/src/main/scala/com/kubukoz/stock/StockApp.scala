@@ -1,36 +1,34 @@
 package com.kubukoz.stock
 
+import cats.data.Chain
+import cats.data.Kleisli
+import cats.mtl.ApplicativeAsk
+import cats.tagless.finalAlg
 import com.kubukoz.events._
+import com.kubukoz.util.KafkaUtils
 import fs2.kafka.KafkaProducer
 import fs2.kafka.ProducerRecord
 import fs2.kafka.ProducerRecords
-import cats.data.Chain
-import cats.tagless.finalAlg
-import org.http4s.HttpRoutes
-import org.http4s.dsl.Http4sDsl
 import fs2.kafka.ProducerSettings
-import org.http4s.server.blaze.BlazeServerBuilder
-import org.http4s.implicits._
-import org.http4s._
 import fs2.kafka.vulcan._
-import skunk.Session
-import io.estatico.newtype.macros.newtype
-import skunk.codec.numeric
-import natchez.Trace
-import com.kubukoz.util.KafkaUtils
-import skunk.codec.text
-import io.circe.generic.extras.Configuration
 import io.circe.Decoder
 import io.circe.Encoder
-import cats.mtl.ApplicativeAsk
-import cats.mtl.FunctorTell
-import cats.data.Kleisli
-import natchez.Span
-import natchez.TraceValue
-import natchez.Kernel
-import natchez.jaeger.Jaeger
-import org.http4s.util.CaseInsensitiveString
+import io.circe.generic.extras.Configuration
+import io.estatico.newtype.macros.newtype
 import natchez.EntryPoint
+import natchez.Kernel
+import natchez.Span
+import natchez.Trace
+import natchez.jaeger.Jaeger
+import org.http4s.HttpRoutes
+import org.http4s._
+import org.http4s.dsl.Http4sDsl
+import org.http4s.implicits._
+import org.http4s.server.blaze.BlazeServerBuilder
+import org.typelevel.ci.CIString
+import skunk.Session
+import skunk.codec.numeric
+import skunk.codec.text
 
 object StockApp extends IOApp {
   import KafkaStuff._
@@ -39,8 +37,8 @@ object StockApp extends IOApp {
   import com.olegpy.meow.hierarchy._
   import cats.mtl.instances.all._
 
-  def mkRoutes[F[_]: Sync: Context.Ask: Trace] = {
-    implicit val repo    = StockRepository.instance[F]
+  def mkRoutes[F[_]: MonadCancelThrow: Context.Ask: Trace]: HttpRoutes[F] = {
+    implicit val repo = StockRepository.instance[F]
     implicit val service = StockService.instance[F]
     StockRoutes.make[F]
   }
@@ -50,44 +48,49 @@ object StockApp extends IOApp {
   type EffTrace[A] = Kleisli[IO, Span[IO], A]
 
   implicit val effTrace: Trace[Eff] = Trace.kleisliInstance[IO].lens(_.span, (ctx, span) => ctx.copy(span = span))
-  val routes                        = mkRoutes[Eff]
+  val routes: HttpRoutes[Eff] = mkRoutes[Eff]
 
-  def requestToSpan[F[_]](ep: EntryPoint[F], r: Request[F]): Resource[F, Span[F]] = {
-    r.headers.get(CaseInsensitiveString("X-B3-TraceId")) match {
-      case Some(traceId) => ep.continue("request" + r.pathInfo, Kernel(Map("X-B3-TraceId" -> traceId.value)))
+  def requestToSpan[F[_]](ep: EntryPoint[F], r: Request[F]): Resource[F, Span[F]] =
+    r.headers.get(CIString("X-B3-TraceId")) match {
+      case Some(traceId) => ep.continue("request" + r.pathInfo, Kernel(Map("X-B3-TraceId" -> traceId.head. /* idk */ value)))
       case None          => ep.root("request" + r.pathInfo)
     }
-  }
 
   val server =
     for {
       jaeger <- Jaeger.entryPoint[IO]("stock-app") { c =>
-        import io.jaegertracing.Configuration.SamplerConfiguration
-        import io.jaegertracing.Configuration.ReporterConfiguration
-        IO(c.withSampler(SamplerConfiguration.fromEnv).withReporter(ReporterConfiguration.fromEnv).getTracer())
-      }
+                  import io.jaegertracing.Configuration.SamplerConfiguration
+                  import io.jaegertracing.Configuration.ReporterConfiguration
+                  IO(c.withSampler(SamplerConfiguration.fromEnv).withReporter(ReporterConfiguration.fromEnv).getTracer())
+                }
 
-      //replace with session.pooled when https://github.com/tpolecat/skunk/issues/124 is resolved
-      sessionPool <- Resource.pure[IO, Resource[EffTrace, Session[EffTrace]]](
-        Session.single[EffTrace]("localhost", user = "postgres", database = "postgres")
-      )
+      sessionPool <- Session
+                       .pooled[EffTrace](host = "localhost", user = "postgres", database = "postgres", max = 16)
+                       .mapK(jaeger.root("init-pool").useKleisliK)
 
       producer <- stockEventProducer[IO].map(sendMessages(_) _).map(KafkaUtils.senderResource(_))
 
-      _ <- BlazeServerBuilder[IO]
-        .withHttpApp(HttpApp[IO] { req =>
-          val contextResource = requestToSpan(jaeger, req).flatMap { span =>
-            val tracedSession =
-              sessionPool.flatTap(_.transaction).mapK(Kleisli.applyK(span)).map(_.mapK(Kleisli.applyK(span)))
+      ec <- Resource.eval(IO.executionContext)
+      _  <- BlazeServerBuilder[IO](ec)
+              .withHttpApp(HttpApp[IO] { req =>
+                val contextResource = requestToSpan(jaeger, req).flatMap { span =>
+                  val tracedSession =
+                    sessionPool
+                      .flatTap(_.transaction)
+                      .mapK(Kleisli.applyK(span))
+                      .map(_.mapK(Kleisli.applyK(span)))
 
-            (tracedSession, producer).mapN(Context[IO](_, _, span))
-          }
+                  (tracedSession, producer).mapN(Context[IO](_, _, span))
+                }
 
-          contextResource.use { ctx =>
-            runContext(Resource.pure[IO, Context[IO]](ctx))(routes).orNotFound.run(req)
-          }
-        })
-        .resource
+                contextResource.use { ctx =>
+                  routes
+                    .translate(Kleisli.applyK(ctx))(Kleisli.liftK)
+                    .orNotFound
+                    .run(req)
+                }
+              })
+              .resource
     } yield ()
 
   def run(args: List[String]): IO[ExitCode] = server.use(_ => IO.never)
@@ -96,10 +99,12 @@ object StockApp extends IOApp {
 object KafkaStuff {
   def avroSettings[F[_]: Sync] = AvroSettings(SchemaRegistryClientSettings[F]("http://localhost:8081"))
 
-  def stockEventProducer[F[_]: ConcurrentEffect: ContextShift] =
-    Resource.liftF(avroSerializer[StockEvent].using(avroSettings).forValue).flatMap { implicit eventSerializer =>
-      fs2.kafka
-        .producerResource[F]
+  def stockEventProducer[F[_]: Async] =
+    Resource.eval(avroSerializer[StockEvent].using(avroSettings).forValue).flatMap { implicit eventSerializer =>
+      fs2
+        .kafka
+        .KafkaProducer
+        .resource[F]
         .using(
           ProducerSettings[F, Unit, StockEvent].withBootstrapServers("localhost:9092")
         )
@@ -110,6 +115,7 @@ object KafkaStuff {
 
     producer.produce(messages).flatMap(_.void)
   }
+
 }
 
 object domain {
@@ -135,6 +141,7 @@ object domain {
 
     implicit val codec: io.circe.Codec[Stock] = deriveConfiguredCodec
   }
+
 }
 
 import domain._
@@ -157,6 +164,7 @@ object StockService {
 
     def find(id: Stock.Id): F[Option[Stock]] = StockRepository[F].retrieveStock(id)
   }
+
 }
 
 @finalAlg
@@ -169,12 +177,10 @@ object StockRepository {
   type SessionAsk[F[_]] = ApplicativeAsk[F, Session[F]]
   def askSession[F[_]](implicit F: SessionAsk[F]): F[Session[F]] = F.ask
 
-  type BracketThrow[F[_]] = Bracket[F, Throwable]
-
-  def instance[F[_]: BracketThrow: SessionAsk]: StockRepository[F] = {
+  def instance[F[_]: MonadCancelThrow: SessionAsk]: StockRepository[F] = {
     object codecs {
       val stockId = numeric.int8.imap(Stock.Id(_))(_.value)
-      val stock   = (stockId ~ text.text).gimap[Stock]
+      val stock = (stockId ~ text.text).gimap[Stock]
     }
 
     new StockRepository[F] {
@@ -197,13 +203,14 @@ object StockRepository {
       }
     }
   }
+
 }
 
 object StockRoutes {
 
   import org.http4s.circe.CirceEntityCodec._
 
-  def make[F[_]: Sync: StockService]: HttpRoutes[F] = {
+  def make[F[_]: MonadThrow: StockService]: HttpRoutes[F] = {
     val dsl = new Http4sDsl[F] {}
     import dsl._
 
@@ -212,7 +219,7 @@ object StockRoutes {
         StockService[F].create(CreateStock(tag)) *> Created()
 
       case GET -> Root / "findById" / id =>
-        Sync[F]
+        MonadThrow[F]
           .catchNonFatal(id.toLong)
           .map(Stock.Id(_))
           .flatMap { id =>
@@ -224,4 +231,5 @@ object StockRoutes {
           }
     }
   }
+
 }

@@ -11,8 +11,9 @@ import skunk.Session
 import skunk.codec.numeric
 import com.kubukoz.events.ReportEvent
 import cats.data.Chain
-import io.chrisdavenport.log4cats.Logger
-import io.chrisdavenport.log4cats.slf4j.Slf4jLogger
+import org.typelevel.log4cats.slf4j.Slf4jLogger
+import org.typelevel.log4cats.Logger
+import com.kubukoz.util.KafkaUtils
 
 object ReportApp extends IOApp {
 
@@ -30,18 +31,16 @@ object ReportApp extends IOApp {
           .withAutoOffsetReset(AutoOffsetReset.Earliest)
           .withIsolationLevel(IsolationLevel.ReadCommitted)
       }
-      .flatMap(consumerStream(_))
+      .flatMap(KafkaConsumer.stream[IO].using(_))
       .evalTap(_.subscribeTo("stock-event"))
       .flatMap(_.stream)
       .evalMap(handleDecodedEvent(outTopic = "report-event") { event =>
         mkSession.map(ReportRepository.instance(_)).use { implicit repo =>
           Ref[IO]
             .of(Chain.empty[ReportEvent])
-            .flatTap {
-              import com.olegpy.meow.effects._
-              _.runTell { implicit tell =>
-                ReportService.instance[IO].handleStockEvent(event)
-              }
+            .flatTap { ref =>
+              implicit val tell = KafkaUtils.refTell(ref)
+              ReportService.instance[IO].handleStockEvent(event)
             }
             .flatMap(_.get)
             .handleErrorWith { e =>
@@ -73,19 +72,21 @@ object ReportApp extends IOApp {
 
   def handleDecodedEvent[F[_]: Functor, G[+_]: Foldable: Functor, K, Event, OutEvent](
     outTopic: String
-  )(handler: Event => F[G[OutEvent]])(
+  )(
+    handler: Event => F[G[OutEvent]]
+  )(
     record: CommittableConsumerRecord[F, K, Event]
-  ): F[CommittableProducerRecords[F, Unit, OutEvent]] = {
+  ): F[CommittableProducerRecords[F, Unit, OutEvent]] =
     handler(record.record.value).map { events =>
       val records = events.map(ProducerRecord(outTopic, (), _))
       CommittableProducerRecords(records, record.offset)
     }
-  }
 
-  def transactionalProduce[F[_]: ConcurrentEffect: ContextShift, K, V](
+  def transactionalProduce[F[_]: Async, K, V](
     settings: TransactionalProducerSettings[F, K, V]
-  ): Pipe[F, TransactionalProducerRecords[F, K, V, Unit], ProducerResult[K, V, Unit]] =
-    records => transactionalProducerStream(settings).flatMap(producer => records.evalMap(producer.produce))
+  ): Pipe[F, TransactionalProducerRecords[F, Unit, K, V], ProducerResult[Unit, K, V]] =
+    records => TransactionalKafkaProducer.stream[F].using[K, V](settings).flatMap(producer => records.evalMap(producer.produce))
+
 }
 
 @finalAlg
@@ -99,10 +100,12 @@ object ReportService {
 
     def handleStockEvent(event: StockEvent): F[Unit] =
       ReportRepository[F]
-        .createReport(Report()) <* ReportEvent.Write[F].tellOne(ReportEvent.Created("foo")) <* Logger[F].info(
-        "Handled event " + event
-      )
+        .createReport(Report()) <*
+        ReportEvent.Write[F].tellOne(ReportEvent.Created("foo")) <*
+        Logger[F].info("Handled event " + event)
+
   }
+
 }
 
 final case class Report()
@@ -119,4 +122,5 @@ object ReportRepository {
 
     def createReport(report: Report): F[Unit] = session.execute(sql"select 1".query(numeric.int4)).void
   }
+
 }

@@ -13,6 +13,7 @@ import cats.mtl.DefaultApplicativeAsk
 import natchez.Span
 import natchez.TraceValue
 import natchez.Kernel
+import java.net.URI
 
 //A bunch of weird things
 object Infrastructure {
@@ -23,6 +24,7 @@ object Infrastructure {
       val functor: Functor[G] = Functor[G]
       def tell(l: A): G[Unit] = fk(ft.tell(l))
     }
+
   }
 
   // I swear, I'll get this merged in cats...
@@ -30,15 +32,9 @@ object Infrastructure {
 
     def map[A, B](fa: ApplicativeAsk[F, A])(f: A => B): ApplicativeAsk[F, B] = new DefaultApplicativeAsk[F, B] {
       val applicative: Applicative[F] = fa.applicative
-      val ask: F[B]                   = fa.reader(f)
+      val ask: F[B] = fa.reader(f)
     }
-  }
 
-  // Maybe this as well...
-  implicit final class ResourceApplyKleisli[F[_], A](private val res: Resource[F, A]) extends AnyVal {
-
-    def runKleisli(implicit B: Bracket[F, Throwable]): Kleisli[F, A, *] ~> F =
-      λ[Kleisli[F, A, *] ~> F](eff => res.use(eff.run))
   }
 
   // Maaaaaaybe this
@@ -51,13 +47,20 @@ object Infrastructure {
 
   implicit class MapKSpan[F[_]](underlying: Span[F]) {
 
-    def mapK[G[_]: Defer: Applicative](
+    def mapK[G[_]: Defer](
       fk: F ~> G
-    )(implicit B: Bracket[F, Throwable]): Span[G] = new Span[G] {
+    )(
+      implicit F: MonadCancelThrow[F],
+      B: MonadCancelThrow[G]
+    ): Span[G] = new Span[G] {
       def put(fields: (String, TraceValue)*): G[Unit] = fk(underlying.put(fields: _*))
-      def kernel: G[Kernel]                           = fk(underlying.kernel)
-      def span(name: String): Resource[G, Span[G]]    = underlying.span(name).mapK(fk).map(_.mapK(fk))
+      def kernel: G[Kernel] = fk(underlying.kernel)
+      def span(name: String): Resource[G, Span[G]] = underlying.span(name).mapK(fk).map(_.mapK(fk))
+      def traceId: G[Option[String]] = fk(underlying.traceId)
+      def spanId: G[Option[String]] = fk(underlying.spanId)
+      def traceUri: G[Option[URI]] = fk(underlying.traceUri)
     }
+
   }
 
   /////////////////////
@@ -70,9 +73,8 @@ object Infrastructure {
 
   final case class Context[F[_]](session: Session[F], eventTell: FunctorTell[F, Chain[StockEvent]], span: Span[F]) {
 
-    def mapK[G[_]: Applicative: Defer](fk: F ~> G)(implicit F: Bracket[F, Throwable]): Context[G] = {
+    def mapK[G[_]: Defer](fk: F ~> G)(implicit F: MonadCancelThrow[F], G: MonadCancelThrow[G]): Context[G] =
       Context(session.mapK(fk), eventTell.mapK(fk), span.mapK(fk))
-    }
   }
 
   object Context {
@@ -80,32 +82,10 @@ object Infrastructure {
     def ask[F[_]](implicit F: Ask[F]): F[Context[F]] = F.ask
   }
 
-  // todo fiddle around with Sync constraint
   // this function basically unifies the effect in Ask[F, Context[F]]
   // given an Ask[Kleisli[F, X, *], Context[F]] for any X
-  implicit def askContextInEff[F[_]: Sync, R](
+  implicit def askContextInEff[F[_]: Defer: MonadCancelThrow, R](
     implicit askF: ApplicativeAsk[Kleisli[F, R, *], Context[F]]
   ): ApplicativeAsk[Kleisli[F, R, *], Context[Kleisli[F, R, *]]] = askF.map(_.mapK(Kleisli.liftK))
-
-  // Shady shit, don't touch
-  // Basically: run the request handling function in one resource, then run the response stream in another one.
-  // http4s's API doesn't allow mixing them that easily
-  // (there could be some plumbing done with resource.allocated and friends but it's too shady even for me)
-  // so here's that
-  //
-  // tl;dr: pass a resource and it'll be used on every request to translate the effect
-  // from Kleisli of the resource to the underlying effect.
-  def runContext[F[_]: Concurrent, Ctx](
-    contextResource: Resource[F, Ctx]
-  )(routesEff: HttpRoutes[Kleisli[F, Ctx, *]]): HttpRoutes[F] =
-    routesEff.local[Request[F]](_.mapK(Kleisli.liftK)).mapF(_.mapK(contextResource.runKleisli)).map { response =>
-      val transactedBody =
-        fs2.Stream
-          .resource(contextResource)
-          .map(Kleisli.applyK[F, Ctx](_))
-          .flatMap(response.body.translateInterruptible(_))
-
-      response.copy(body = transactedBody)
-    }
 
 }

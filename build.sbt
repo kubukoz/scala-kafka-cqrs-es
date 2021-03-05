@@ -2,7 +2,9 @@ inThisBuild(
   List(
     organization := "com.kubukoz",
     homepage := Some(url("https://github.com/kubukoz/kafka-demo")),
-    licenses := List("Apache-2.0" -> url("http://www.apache.org/licenses/LICENSE-2.0")),
+    licenses := List(
+      "Apache-2.0" -> url("http://www.apache.org/licenses/LICENSE-2.0")
+    ),
     developers := List(
       Developer(
         "kubukoz",
@@ -15,12 +17,14 @@ inThisBuild(
 )
 
 val compilerPlugins = List(
-  compilerPlugin("org.typelevel" % "kind-projector"      % "0.11.0" cross CrossVersion.full),
-  compilerPlugin("com.olegpy"    %% "better-monadic-for" % "0.3.1")
+  compilerPlugin(
+    "org.typelevel" % "kind-projector" % "0.11.3" cross CrossVersion.full
+  ),
+  compilerPlugin("com.olegpy" %% "better-monadic-for" % "0.3.1")
 )
 
 val commonSettings = Seq(
-  scalaVersion := "2.13.1",
+  scalaVersion := "2.13.5",
   scalacOptions ~= (_.filterNot(_ == "-Xfatal-warnings") ++ Seq(
     "-Ymacro-annotations",
     "-Yimports:" ++ List(
@@ -29,40 +33,39 @@ val commonSettings = Seq(
       "cats",
       "cats.implicits",
       "cats.effect",
-      "cats.effect.implicits",
-      "cats.effect.concurrent"
+      "cats.effect.implicits"
     ).mkString(",")
   )),
   fork in Test := true,
   updateOptions := updateOptions.value.withGigahorse(false),
   resolvers += "confluent" at "https://packages.confluent.io/maven/",
   libraryDependencies ++= Seq(
-    "org.http4s"        %% "http4s-blaze-server"  % "0.21.0-M5",
-    "org.http4s"        %% "http4s-dsl"           % "0.21.0-M5",
-    "org.http4s"        %% "http4s-circe"         % "0.21.0-M5",
-    "dev.profunktor"    %% "console4cats"         % "0.8.0",
-    "ch.qos.logback"    % "logback-classic"       % "1.2.3",
-    "io.chrisdavenport" %% "log4cats-slf4j"       % "1.0.1",
-    "org.typelevel"     %% "cats-tagless-macros"  % "0.10",
-    "io.circe"          %% "circe-generic-extras" % "0.12.2",
-    "com.olegpy"        %% "meow-mtl-core"        % "0.4.0",
-    "com.olegpy"        %% "meow-mtl-effects"     % "0.4.0",
-    "com.ovoenergy"     %% "fs2-kafka-vulcan"     % "0.20.2",
-    "com.ovoenergy"     %% "vulcan-generic"       % "0.3.1",
-    "org.tpolecat"      %% "natchez-jaeger"       % "0.0.10",
-    "org.tpolecat"      %% "skunk-core"           % "0.0.7",
-    "org.tpolecat"      %% "skunk-circe"          % "0.0.7",
-    "io.estatico"       %% "newtype"              % "0.4.3",
-    "org.scalatest"     %% "scalatest"            % "3.1.0" % Test
+    "org.http4s" %% "http4s-blaze-server" % "1.0.0-M19",
+    "org.http4s" %% "http4s-dsl" % "1.0.0-M19",
+    "org.http4s" %% "http4s-circe" % "1.0.0-M19",
+    "ch.qos.logback" % "logback-classic" % "1.2.3",
+    "org.typelevel" %% "log4cats-slf4j" % "2.0.0-RC1",
+    "org.typelevel" %% "cats-tagless-macros" % "0.10",
+    "io.circe" %% "circe-generic-extras" % "0.12.2",
+    "com.olegpy" %% "meow-mtl-core" % "0.4.0",
+    "com.github.fd4s" %% "fs2-kafka-vulcan" % "3.0.0-M2",
+    "com.github.fd4s" %% "vulcan-generic" % "1.4.1",
+    "org.tpolecat" %% "natchez-jaeger" % "0.1.0-M4",
+    "org.tpolecat" %% "skunk-core" % "0.1.0-M1",
+    "org.tpolecat" %% "skunk-circe" % "0.1.0-M1",
+    "io.estatico" %% "newtype" % "0.4.3",
+    "org.scalatest" %% "scalatest" % "3.1.0" % Test
   ) ++ compilerPlugins
 )
 
 def app(name: String) =
-  Project(name, file(s"applications/$name")).settings(commonSettings).enablePlugins(JavaAppPackaging)
+  Project(name, file(s"applications/$name"))
+    .settings(commonSettings)
+    .enablePlugins(JavaAppPackaging)
 
 val events = project.in(file("applications/events")).settings(commonSettings)
 
-val stock   = app("stock").dependsOn(events)
+val stock = app("stock").dependsOn(events)
 val reports = app("reports").dependsOn(events)
 
 val root =
@@ -70,4 +73,4 @@ val root =
     .in(file("."))
     .settings(name := "kafka-demo", commonSettings)
     .settings(skip in publish := true)
-    .aggregate(stock, reports)
+    .aggregate(stock, reports, events)
