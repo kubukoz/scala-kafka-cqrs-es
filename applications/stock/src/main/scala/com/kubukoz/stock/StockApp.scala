@@ -180,6 +180,7 @@ object StockRepository {
   def instance[F[_]: MonadCancelThrow: SessionAsk]: StockRepository[F] = {
     object codecs {
       val stockId = numeric.int8.imap(Stock.Id(_))(_.value)
+      val newStock: skunk.Encoder[Stock] = text.text.contramap[Stock](_.tag)
       val stock = (stockId ~ text.text).gimap[Stock]
     }
 
@@ -189,7 +190,7 @@ object StockRepository {
         import skunk.implicits._
 
         val action: F[Unit] =
-          session.prepare(sql"insert into stock(id, tag) values(${codecs.stock})".command).use(_.execute(stock)).void
+          session.prepare(sql"insert into stock(id, tag) values(${codecs.newStock})".command).use(_.execute(stock)).void
 
         action.as(Stock.Id(0))
       }
@@ -219,12 +220,10 @@ object StockRoutes {
         StockService[F].create(CreateStock(tag)) *> Created()
 
       case GET -> Root / "findById" / id =>
-        MonadThrow[F]
-          .catchNonFatal(id.toLong)
+        id.toLongOption
+          .liftTo[F](new Throwable(s"not a long! $id"))
           .map(Stock.Id(_))
-          .flatMap { id =>
-            StockService[F].find(id)
-          }
+          .flatMap(StockService[F].find)
           .flatMap {
             case None        => NotFound()
             case Some(stock) => Ok(stock)
